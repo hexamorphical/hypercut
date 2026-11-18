@@ -22,8 +22,8 @@ HyperCut listens to your audio and cuts it up live, in time with your DAW: stutt
 euclidean retriggers, ratchet build-ups and a drawable trance gate. A chain of slice-aware effects follows it. It is
 free software under the GNU GPL.
 
-> **v0.1 beta.** The Linux x86_64 build is the one in daily use. macOS and Windows should build from the same source
-> (see [Building](#building)), but no binaries are provided for them yet and they have not been tested.
+> **v0.1 beta.** The Linux build is the one in daily use. Windows and macOS builds are provided too, but have not been
+> tested on real hardware yet.
 
 ## Contents
 
@@ -57,21 +57,32 @@ The full git history of Livecut and the DPF port is kept in this repository.
 
 ## Download and install
 
-Get the latest build from the [Releases page](https://github.com/hexamorphical/hypercut/releases) and unzip the format
-your DAW uses into its folder:
+Get the latest build for your system from the [Releases page](https://github.com/hexamorphical/hypercut/releases) and
+unzip the format your DAW uses into its plugin folder:
 
-| Format | Linux folder |
-| --- | --- |
-| VST3 (`HyperCut.vst3`, a folder) | `~/.vst3/` |
-| CLAP (`HyperCut.clap`) | `~/.clap/` |
-| LV2 (`HyperCut.lv2`, a folder) | `~/.lv2/` |
-| VST2 (`HyperCut-vst.so`) | `~/.vst/` |
-| Standalone (`HyperCut`) | anywhere; it runs as a JACK client (PipeWire: `pw-jack ./HyperCut`) |
+| Format | Linux | Windows | macOS |
+| --- | --- | --- | --- |
+| VST3 (`HyperCut.vst3`) | `~/.vst3/` | `C:\Program Files\Common Files\VST3\` | `~/Library/Audio/Plug-Ins/VST3/` |
+| CLAP (`HyperCut.clap`) | `~/.clap/` | `C:\Program Files\Common Files\CLAP\` | `~/Library/Audio/Plug-Ins/CLAP/` |
+| LV2 (`HyperCut.lv2`) | `~/.lv2/` | `C:\Program Files\Common Files\LV2\` | `~/Library/Audio/Plug-Ins/LV2/` |
+| VST2 | `HyperCut-vst.so` in `~/.vst/` | `HyperCut-vst.dll` in your DAW's VST folder | `HyperCut.vst` in `~/Library/Audio/Plug-Ins/VST/` |
+| Standalone | `HyperCut` (JACK; on PipeWire run `pw-jack ./HyperCut`) | `HyperCut.exe` | `HyperCut.app` |
 
 Then rescan plugins in your DAW. HyperCut is an effect: put it on an audio track (drums and loops are the classic
 source) and press play. It follows the host's tempo and time signature.
 
-The plugin needs OpenGL and X11, which are on every desktop Linux system.
+- **Linux**: x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 or newer), OpenGL and X11.
+- **Windows**: 64-bit Windows 10 or 11. The plugins are not code-signed, so the browser or SmartScreen may warn about
+  the download.
+- **macOS**: 10.15 or newer, as one universal build for Intel and Apple Silicon. The plugins are not notarized by
+  Apple, so macOS blocks them at first. After copying them, run this in Terminal once (for each format you installed):
+
+  ```sh
+  xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/HyperCut.vst3
+  ```
+
+> The Windows and macOS builds are made automatically by GitHub Actions and have not been tested on real hardware yet.
+> Reports in [Issues](https://github.com/hexamorphical/hypercut/issues) are very welcome.
 
 ## Features
 
