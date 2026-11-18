@@ -1,6 +1,7 @@
-# Builds HyperCut for Linux, Windows and macOS.
+# Builds HyperCut for Windows and macOS. Linux release builds are made locally with scripts/build-linux-release.sh
+# and uploaded to the release by hand.
 #
-# - Every push to master and every pull request: build all three, keep the zips as workflow artifacts.
+# - Every push to master and every pull request: build both, keep the zips as workflow artifacts.
 # - Pushing a tag like v0.2-beta: also publish the zips to that release (created as a pre-release if missing).
 # - Run it by hand (Actions > build > Run workflow) with a release tag to (re)upload the zips to an existing release.
 
@@ -26,30 +27,6 @@ env:
   VERSION: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || format('dev-{0}', github.sha) }}
 
 jobs:
-  linux:
-    name: Linux x86_64
-    runs-on: ubuntu-latest
-    # built on Ubuntu 22.04 (glibc 2.35) so the binaries also load on older distributions
-    container: ubuntu:22.04
-    steps:
-      - name: Install build tools
-        run: |
-          apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
-            build-essential git ca-certificates pkg-config zip \
-            libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxrandr-dev libdbus-1-dev
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Build
-        run: make -j"$(nproc)"
-      - name: Package
-        run: bash scripts/package.sh "${VERSION:0:24}" linux-x86_64
-      - uses: actions/upload-artifact@v4
-        with:
-          name: hypercut-linux-x86_64
-          path: dist/*.zip
-
   windows:
     name: Windows x64
     runs-on: windows-latest
@@ -106,7 +83,7 @@ jobs:
 
   release:
     name: Publish to the release
-    needs: [linux, windows, macos]
+    needs: [windows, macos]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
@@ -116,8 +93,6 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Checksums
-        run: cd dist && sha256sum ./*.zip > SHA256SUMS.txt && cat SHA256SUMS.txt
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
@@ -125,6 +100,11 @@ jobs:
         run: |
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
-              --title "HyperCut $TAG" --notes "Builds for Linux, Windows and macOS. See the README for installing."
+              --title "HyperCut $TAG" --notes "Builds for Windows and macOS (Linux builds are added separately). See the README for installing."
           fi
-          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$TAG" dist/*.zip --repo "$GITHUB_REPOSITORY" --clobber
+          # checksums of every zip on the release, the Linux ones uploaded by hand included
+          mkdir -p all
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --dir all --clobber
+          (cd all && sha256sum ./*.zip > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          gh release upload "$TAG" all/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber

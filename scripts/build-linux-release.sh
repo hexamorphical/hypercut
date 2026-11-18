@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the Linux x86_64 release binaries so they also run on older distributions (glibc 2.35+), then packages
-# every format into dist/ (the GitHub Actions workflow builds all platforms the same way). Usage: scripts/build-linux-release.sh <version>   e.g. scripts/build-linux-release.sh v0.1-beta
+# every format into dist/ (GitHub Actions builds Windows and macOS). Usage: scripts/build-linux-release.sh <version>   e.g. scripts/build-linux-release.sh v0.1-beta
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VERSION="${1:?usage: $0 <version>}"
