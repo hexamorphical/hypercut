@@ -503,34 +503,12 @@ struct FactoryPreset {
 
 static const FactoryPreset kFactoryPresets[] = {
     { "Init", "Basic", "" },
+    // ---- by Hexamorphical ----
     { "Jungle Classic", "Jungle",
       "fade=0;minpan=-0.00052267313;maxpan=-0.00052267313;minpitch=-2400;maxpitch=2400;crusher=1"
       ";minbits=20.0380764;minfreq=2475.34351;mindelay=1;maxdelay=4.45629597;limiter=1"
       ";limceil=-0.856194496;mincut=1;transient=1;trsustain=-0.487063766",
       "Hexamorphical" },
-    { "Amen Stutter", "Jungle", "cutproc=0;subdiv=3;stutter=1;area=0.9;minrep=1;maxrep=3;fade=2;minpan=-0.3;maxpan=0.3" },
-    { "Detuned Pan", "Glitch", "cutproc=0;subdiv=1;stutter=0.7;minpan=-0.8;maxpan=0.8;minpitch=-200;maxpitch=200" },
-    { "Gentle Glitch", "Glitch", "cutproc=0;subdiv=3;mincut=2;stutter=0.5;area=0.4;duty=0.9;fade=3;mix=0.85" },
-    { "Warp Rolls", "Rolls", "cutproc=1;subdiv=1;straight=0.3;regular=0.6;ritard=0.4;speed=0.9;fillduty=0.8" },
-    { "Tape Ritard", "Rolls", "cutproc=1;subdiv=1;straight=0.2;regular=0.2;ritard=0.9;speed=0.85;minpitch=-400;maxpitch=0" },
-    { "Metal Comb", "FX", "cutproc=1;subdiv=3;comb=1;type=1;feedback=0.75;mindelay=2;maxdelay=12;limiter=1" },
-    { "Squarepusher", "Glitch", "cutproc=2;subdiv=3;activity=0.8;minpan=-0.5;maxpan=0.5" },
-    { "Lo-Fi Crunch", "Glitch", "cutproc=2;subdiv=3;activity=0.6;crusher=1;minbits=6;maxbits=10;minfreq=6000;maxfreq=16000;lpmin=2500;lpfreq=12000;reso=0.3" },
-    { "Euclid Tresillo", "Rhythmic", "cutproc=0.5;subdiv=1;eudensity=0.17;euchance=1" },
-    { "Euclid Echo", "Rhythmic", "cutproc=0.5;subdiv=1;eudensity=0.6;euchance=0.9;euslice=1;duty=0.8" },
-    { "Euclid Shuffle", "Rhythmic", "cutproc=0.5;subdiv=3;eudensity=0.45;euchance=0.85;euslice=4;minpan=-0.4;maxpan=0.4" },
-    { "Ratchet Build", "Rolls", "cutproc=1.5;subdiv=3;raintensity=0.85;racurve=0.3;minphrs=4;maxphrs=4" },
-    { "Triplet Riser", "Rolls", "cutproc=1.5;subdiv=2;raintensity=1;racurve=0.6;minpitch=0;maxpitch=1200;minphrs=2;maxphrs=2" },
-    { "Dub Throws", "FX", "cutproc=0;subdiv=1;stutter=0.7;area=0.6;reverb=1;rvchance=0.25;rvsendmin=0.5;rvsendmax=0.9;rvdecaymin=2;rvdecaymax=6;rvsize=0.8;rvdamp=0.55" },
-    { "Fill Every 16", "Rhythmic", "cutproc=0;subdiv=1;fillmode=1;fillcycle=1;fillbars=2;stutter=1;area=0.8;limiter=1" },
-    { "Pitchmap Keys", "FX", "cutproc=0;subdiv=1;stutter=0.6;area=0.5;chroma=1;chkey=9;chscale=1;chcolor=1.35" },
-    { "Trance Gate 16ths", "Gate", "gate=1;gatemode=1;subdiv=3;gatepat1=46811;gatepat2=46811;duty=0.75;fade=1.5" },
-    { "Random Gate", "Gate", "gate=1;gatemode=0;subdiv=3;gatedensity=0.55;gatevary=0.3;duty=0.85;fade=1" },
-    { "Gate Throws", "Gate", "gate=1;gatemode=0;subdiv=3;gatedensity=0.45;gatevary=0.2;duty=0.6;fade=2;reverb=1;rvchance=0.3;rvsendmin=0.4;rvsendmax=0.8;rvsize=0.7" },
-    { "Dub Echo", "FX", "cutproc=0;subdiv=1;stutter=0.6;area=0.5;comb=1;dlymode=1;dlystereo=2;dlytimel=6;feedback=0.6;dlymix=0.4;dlytone=0.55" },
-    { "Gate Echo", "Gate", "gate=1;gatemode=1;subdiv=3;gatepat1=46811;gatepat2=46811;duty=0.6;comb=1;dlymode=1;dlystereo=1;dlytimel=5;dlytimer=6;feedback=0.45;dlymix=0.35;dlytone=0.3" },
-    { "Pentatonic Shimmer", "FX", "cutproc=1.5;subdiv=3;raintensity=0.7;chroma=1;chkey=4;chscale=10;chcolor=1.6;chpitch=12;reverb=1;rvchance=0.3;rvsize=0.8" },
-    // ---- by Hexamorphical ----
     { "Instant Colorbass", "FX",
       "cutproc=0.5;fade=0;minpan=-0.00286000967;maxpan=-0.00286000967;activity=1;minbits=14.3492155"
       ";minfreq=4772.875;reso=1;euslice=4;filter=0;lpmin=20;rvchance=1;rvsendmin=0"

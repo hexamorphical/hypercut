@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>Real-time audio slicer, spectral pitchmapping and trance gate runnig inside a complex sequencer</b><br>
+  <b>Real-time audio slicer, spectral pitchmapping and trance gate running inside a complex sequencer</b><br>
   <p align="center">
   VST3 · CLAP · LV2 · VST2 · JACK standalone
   </p>
@@ -182,8 +182,8 @@ Effects in front of SLICE process what the slicer records; the ones after it pro
 - **English and Spanish**, switched with the flag buttons at the top. On Linux the first start follows your system
   language.
 - **Logo sparks**: every chop throws glowing sparks out of the HyperCut logo, faster as the cutting speeds up.
-- **Presets**: a browser that slides out on the right, with 31 factory presets (8 of them by hexamorphical, such as
-  *Lush Pad Gater*, *Skrill Vocals* and *Instant Colorbass*) and your own. Sort by name, author or category, search,
+- **Presets**: a browser that slides out on the right, with 8 factory presets by hexamorphical (such as
+  *Lush Pad Gater*, *Skrill Vocals* and *Instant Colorbass*), the Init patch, and your own. Sort by name, author or category, search,
   save, and see unsaved changes. A preset you save under a factory preset's name takes its place in the list.
 - **Undo / redo** (Ctrl+Z / Ctrl+Shift+Z) for every edit, preset load and dice roll.
 - **Dice**: the big die randomizes the whole patch within musical ranges; each panel's small die randomizes just that
