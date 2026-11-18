@@ -2,7 +2,7 @@
 # and uploaded to the release by hand.
 #
 # - Every push to master and every pull request: build both, keep the zips as workflow artifacts.
-# - Pushing a tag like v0.2-beta: also publish the zips to that release (created as a pre-release if missing).
+# - Pushing a tag like v0.2-beta: also publish the zips to that release (created and marked Latest if missing).
 # - Run it by hand (Actions > build > Run workflow) with a release tag to (re)upload the zips to an existing release.
 
 name: build
@@ -99,7 +99,7 @@ jobs:
           TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
               --title "HyperCut $TAG" --notes "Builds for Windows and macOS (Linux builds are added separately). See the README for installing."
           fi
           gh release upload "$TAG" dist/*.zip --repo "$GITHUB_REPOSITORY" --clobber

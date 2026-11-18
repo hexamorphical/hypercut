@@ -16,6 +16,12 @@
   <img alt="Built with DPF" src="https://img.shields.io/badge/built%20with-DPF-7bb78b">
 </p>
 
+<p align="center">
+  <a href="https://github.com/hexamorphical/hypercut/releases/latest/download/HyperCut-windows-x64.zip"><img alt="Download for Windows" src="https://img.shields.io/badge/Download-Windows-2f81f7?style=for-the-badge"></a>
+  <a href="https://github.com/hexamorphical/hypercut/releases/latest/download/HyperCut-macos-universal.zip"><img alt="Download for macOS" src="https://img.shields.io/badge/Download-macOS-8250df?style=for-the-badge"></a>
+  <a href="https://github.com/hexamorphical/hypercut/releases/latest/download/HyperCut-linux-x86_64.zip"><img alt="Download for Linux" src="https://img.shields.io/badge/Download-Linux-e8a33d?style=for-the-badge"></a>
+</p>
+
 ![HyperCut](docs/images/screenshot.png)
 
 HyperCut listens to your audio and cuts it up live, in time with your DAW: stutters, rolls, jungle-style rearranges,
@@ -57,8 +63,9 @@ The full git history of Livecut and the DPF port is kept in this repository.
 
 ## Download and install
 
-Download the zip for your system from the [Releases page](https://github.com/hexamorphical/hypercut/releases). Each zip
-has every format; copy the one your DAW uses into its plugin folder:
+Download the zip for your system with the buttons at the top, or from the
+[Releases page](https://github.com/hexamorphical/hypercut/releases). Each zip has every format; copy the one your DAW
+uses into its plugin folder:
 
 | Format | Linux | Windows | macOS |
 | --- | --- | --- | --- |
