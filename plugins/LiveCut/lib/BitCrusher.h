@@ -48,6 +48,8 @@ public:
 	void SetMaxFreq(float v);
 	void SetSampleRate(float v);
 	void SetOn(bool v);
+	float GetBits() const { return std::log2(multiplier); }
+	float GetFreq() const { return lag > 0.f ? sr / lag : sr; }
   
 	inline void tick(float &out1,float &out2, const float in1, const float in2)
 	{

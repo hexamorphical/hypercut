@@ -26,6 +26,13 @@ CutInfo::CutInfo()
 , pan(0.f)
 , amp(1.f)
 , cents(0.f)
+, offset(0)
+, step(-1)
+, envattack(0.f)
+, envdecay(0.f)
+, envtension(0.f)
+, tiedin(false)
+, tiedout(false)
 {
 }
 
@@ -40,7 +47,9 @@ CutProc::CutProc()
 , filldutycycle(1.f)
 , maxphraselength(4)
 , minphraselength(1)
+, lastkind(0)
 {
+  lastinfo[0] = lastinfo[1] = lastinfo[2] = 0;
 }
 
 CutProc::~CutProc() {}
@@ -114,6 +123,10 @@ void CutProc11::ChooseCuts(std::vector<CutInfo> &cuts,
     repeats=unitsleft*multiplier;
     double unitsinthiscut= 1.0/multiplier;
     unitsinblock = repeats*unitsinthiscut;
+    lastkind = kBlockStutter;
+    lastinfo[0] = multiplier;
+    lastinfo[1] = repeats;
+    lastinfo[2] = 0;
     cuts.resize(repeats);
     const float startpan    = Math::randomfloat(minpan,maxpan);
     const float endpan      = Math::randomfloat(minpan,maxpan);
@@ -159,6 +172,10 @@ void CutProc11::ChooseCuts(std::vector<CutInfo> &cuts,
       }
     }
     unitsinblock = repeats*unitsincut;
+    lastkind = kBlockNormal;
+    lastinfo[0] = unitsincut;
+    lastinfo[1] = repeats;
+    lastinfo[2] = 0;
     cuts.resize(repeats);
     for(int i=0;i<repeats;i++)
     {
@@ -217,6 +234,9 @@ void WarpCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
   
   if(Math::randomfloat(0.0, 1.0)< straightchance)
   {
+    lastkind = kBlockStraight;
+    lastinfo[0] = unitsinblock;
+    lastinfo[1] = lastinfo[2] = 0;
     double temp = double(unitsinblock)/double(repeats);
     cuts.resize(repeats);
     for(int i=0;i<repeats;i++)
@@ -242,6 +262,10 @@ void WarpCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
     {
       //long repeatsarray[] = {4,6,8,12,16,18,24,32};
       //repeats = repeatsarray[Math::randominteger(0,7)];
+      lastkind = kBlockRoll;
+      lastinfo[0] = repeats;
+      lastinfo[1] = unitsinblock;
+      lastinfo[2] = 0;
       double temp = double(unitsinblock)/double(repeats);
       cuts.resize(repeats);
       for(int i=0;i<repeats;i++)
@@ -269,8 +293,15 @@ void WarpCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
         cuts[i].amp = startamp + (endamp-startamp)*phase;
         cuts[i].cents = startdetune + (enddetune-startdetune)*phase;
       }
+      lastkind = kBlockAccel;
+      lastinfo[0] = repeats;
+      lastinfo[1] = unitsinblock;
+      lastinfo[2] = 0;
       if(Math::randomfloat(0.0, 1.0)< ritardchance)
+      {
         std::reverse(cuts.begin(),cuts.end());
+        lastkind = kBlockRitard;
+      }
     }
   }
 }
@@ -401,6 +432,10 @@ void SQPusherCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
   {
     if(fillpos<cs[fillnumber].size())
     {
+      lastkind = kBlockFill;
+      lastinfo[0] = fillnumber;
+      lastinfo[1] = fillpos;
+      lastinfo[2] = long(cs[fillnumber].size());
       cuts.resize(cs[fillnumber][fillpos].size());
       double beatsdone = 0.0;
       for(int i=0;i<cuts.size();i++)
@@ -438,6 +473,9 @@ void SQPusherCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
     
     if(Math::randomfloat(0.0,1.0) < sqchance) // 2*temp semiquaver
     {
+      lastkind = kBlockSemiquavers;
+      lastinfo[0] = temp*2;
+      lastinfo[1] = lastinfo[2] = 0;
       cuts.resize(temp*2);
       for(int i=0;i<cuts.size();i++)
       {
@@ -451,6 +489,9 @@ void SQPusherCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
     }
     else            // or temp quaver i.e same duration
     {
+      lastkind = kBlockQuavers;
+      lastinfo[0] = temp;
+      lastinfo[1] = lastinfo[2] = 0;
       cuts.resize(temp);
       for(int i=0;i<cuts.size();i++)
       {
@@ -465,7 +506,323 @@ void SQPusherCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
 }
 
 //-------------------------------------------------------------------------------
+// Euclidean cutter
+//-------------------------------------------------------------------------------
+EuclidCutProc::EuclidCutProc()
+: density(0.45f)
+, chance(0.8f)
+, slice(0)
+{
+}
 
+void EuclidCutProc::SetSlice(long v) { slice = v; }
+
+void EuclidCutProc::SetDensity(float v) { density = v; }
+void EuclidCutProc::SetChance(float v) { chance = v; }
+
+void EuclidCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
+                               long &unitsinblock,
+                               long unitsdone,
+                               long totalunits,
+                               long subdiv,
+                               double spu)
+{
+  const long unitsleft = totalunits - unitsdone;
+  const long toBarEnd  = subdiv - (unitsdone % subdiv);
+
+  // half-bar or whole-bar blocks, never crossing a bar line or the phrase end
+  long n = subdiv;
+  if(subdiv >= 12 && Math::randomfloat(0.0, 1.0) < 0.5)
+    n = subdiv / 2;
+  n = std::min(n, std::min(toBarEnd, unitsleft));
+  if(n < 1) n = 1;
+  unitsinblock = n;
+
+  const bool fillzone = unitsleft <= subdiv; // last bar of the phrase
+
+  if(n < 3 || Math::randomfloat(0.0, 1.0) > chance)
+  {
+    // play the block straight
+    cuts.resize(1);
+    cuts[0].size   = long(n * spu);
+    cuts[0].length = long(n * spu * dutycycle);
+    cuts[0].amp    = Math::randomfloat(minamp, maxamp);
+    lastkind = kBlockStraight;
+    lastinfo[0] = lastinfo[1] = lastinfo[2] = 0;
+    return;
+  }
+
+  // number of onsets
+  const float d = fillzone ? std::min(1.f, density + 0.3f) : density;
+  long k = long(2.0 + double(d) * double(n - 2) + 0.5);
+  k = std::max(2L, std::min(n, k));
+
+  // Bresenham-style euclidean onsets, then gaps between them
+  std::vector<long> gaps;
+  gaps.reserve(k);
+  long last = 0;
+  for(long i = 1; i <= n; ++i)
+  {
+    const bool onset = (i == n) || (((i * k) % n) < k);
+    if(onset)
+    {
+      gaps.push_back(i - last);
+      last = i;
+    }
+  }
+
+  // random rotation keeps it from always starting with the long gap
+  const long rot = Math::randominteger(0, long(gaps.size()) - 1);
+  std::rotate(gaps.begin(), gaps.begin() + (rot % long(gaps.size())), gaps.end());
+
+  const float duty = fillzone ? filldutycycle : dutycycle;
+  cuts.resize(gaps.size());
+  long onset = 0; // position of this hit in the block, in units
+  std::vector<long> onsets(gaps.size());
+  for(size_t i = 0; i < gaps.size(); ++i)
+  {
+    onsets[i] = onset;
+    onset += gaps[i];
+
+    // the slice this hit replays: an earlier (already recorded) hit's position
+    long src = (slice >= 4) ? Math::randominteger(0, long(i)) : std::min<long>(slice, long(i));
+    src = std::max(0L, std::min<long>(src, long(i)));
+    cuts[i].offset = long(onsets[src] * spu);
+
+    cuts[i].size   = long(gaps[i] * spu);
+    cuts[i].length = long(gaps[i] * spu * duty);
+    cuts[i].amp    = (i == 0) ? maxamp : Math::randomfloat(minamp, maxamp); // accent the downbeat
+    cuts[i].pan    = Math::randomfloat(minpan, maxpan);
+    cuts[i].cents  = (i == 0) ? 0.f : Math::randomfloat(mindetune, maxdetune);
+  }
+  lastkind = kBlockEuclid;
+  lastinfo[0] = k;
+  lastinfo[1] = n;
+  lastinfo[2] = rot % long(gaps.size());
+}
+
+//-------------------------------------------------------------------------------
+// Ratchet builder
+//-------------------------------------------------------------------------------
+RatchetCutProc::RatchetCutProc()
+: intensity(0.6f)
+, curve(0.5f)
+{
+}
+
+void RatchetCutProc::SetIntensity(float v) { intensity = v; }
+void RatchetCutProc::SetCurve(float v) { curve = v; }
+
+void RatchetCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
+                                long &unitsinblock,
+                                long unitsdone,
+                                long totalunits,
+                                long subdiv,
+                                double spu)
+{
+  static const long options[8] = { 1, 2, 3, 4, 6, 8, 12, 16 };
+
+  const long unitsleft = totalunits - unitsdone;
+  long n = std::max(1L, subdiv / 4); // one beat in 4/4
+  n = std::min(n, std::max(1L, unitsleft));
+  unitsinblock = n;
+
+  // phrase progress shaped by curve: 0 = builds late, 1 = builds early
+  const double progress = totalunits > 0 ? double(unitsdone) / double(totalunits) : 0.0;
+  const double exponent = 3.0 + (0.35 - 3.0) * double(curve);
+  const double shaped   = std::pow(std::max(0.0, std::min(1.0, progress)), exponent);
+  const double level    = double(intensity) * shaped;
+
+  long top = long(level * 7.0 + 0.5);
+  long idx;
+  if(unitsleft <= n) // final beat of the phrase: full roll
+    idx = std::max(long(intensity * 7.0 + 0.5), intensity > 0.f ? 1L : 0L);
+  else
+    idx = Math::randominteger(std::max(0L, top - 2), top);
+  idx = std::max(0L, std::min(7L, idx));
+  const long reps = options[idx];
+
+  const double cutunits = double(n) / double(reps);
+  const float  riser    = mindetune + (maxdetune - mindetune) * float(shaped);
+  const float  amp      = minamp + (maxamp - minamp) * float(0.5 + 0.5 * shaped);
+  const float  duty     = reps > 1 ? filldutycycle : dutycycle;
+
+  lastkind = kBlockRatchet;
+  lastinfo[0] = reps;
+  lastinfo[1] = idx;
+  lastinfo[2] = 0;
+  cuts.resize(reps);
+  for(long i = 0; i < reps; ++i)
+  {
+    const long l = long(cutunits * spu + 0.5);
+    cuts[i].size   = l;
+    cuts[i].length = long(float(l) * duty);
+    cuts[i].amp    = amp;
+    cuts[i].pan    = (reps > 1) ? ((i % 2 == 0) ? minpan : maxpan) : 0.5f * (minpan + maxpan);
+    cuts[i].cents  = riser;
+  }
+}
+
+//-------------------------------------------------------------------------------
+// Trance gate
+//-------------------------------------------------------------------------------
+GateCutProc::GateCutProc()
+: mode(0)
+, density(0.6f)
+, variation(0.25f)
+, pattern(0x55555555ul)
+, mask(0)
+, randmask(0)
+{
+  for(int i = 0; i < 16; ++i) env[i] = 0;
+  for(int i = 0; i < 16; ++i) tensions[i] = 0;
+  ties = 0;
+}
+
+// random state of one step: on-beat steps are more likely to be open, so sparse patterns still groove
+bool GateCutProc::RollStep(long step, long subdiv)
+{
+  const bool onbeat = subdiv >= 4 && (step * 4) % subdiv == 0;
+  const double p = onbeat ? density + (1.0 - density) * 0.4 : density * 0.85;
+  return Math::randomfloat(0.0, 1.0) < p;
+}
+
+void GateCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
+                             long &unitsinblock,
+                             long unitsdone,
+                             long totalunits,
+                             long subdiv,
+                             double spu)
+{
+  const long unitsleft = totalunits - unitsdone;
+  const long pos = unitsdone % subdiv;  // step at which this block starts
+  long n = std::min(subdiv - pos, unitsleft); // up to the bar line
+  if(n < 1) n = 1;
+  unitsinblock = n;
+  const long steps = std::min(subdiv, 32L);
+
+  if(mode == 1)
+  {
+    mask = pattern;
+  }
+  else
+  {
+    if(unitsdone == 0) // new phrase: a fresh pattern
+    {
+      randmask = 0;
+      for(long st = 0; st < steps; ++st)
+        if(RollStep(st, subdiv))
+          randmask |= 1ul << st;
+    }
+    else if(pos == 0 && variation > 0.f) // new bar: re-roll some steps
+    {
+      for(long st = 0; st < steps; ++st)
+        if(Math::randomfloat(0.0, 1.0) < variation)
+        {
+          if(RollStep(st, subdiv)) randmask |= 1ul << st;
+          else randmask &= ~(1ul << st);
+        }
+    }
+    if(density > 0.f && (randmask & ((steps >= 32) ? 0xFFFFFFFFul : ((1ul << steps) - 1ul))) == 0)
+      randmask |= 1ul; // never a fully silent bar unless density is zero
+    mask = randmask;
+  }
+
+  cuts.resize(n);
+  long open = 0;
+  // ties (drawn pattern only): an open step tied to the next open step plays on into it as one slice
+  auto isOn = [&](long st) { return st >= 0 && st < steps && ((mask >> st) & 1ul); };
+  auto tiedOut = [&](long st) { return mode == 1 && st + 1 < steps && isOn(st) && isOn(st + 1) && ((ties >> st) & 1ul); };
+  for(long i = 0; i < n; ++i)
+  {
+    const long st = pos + i;
+    const long a = long(double(i) * spu);
+    const long b = long(double(i + 1) * spu); // sizes add up to the block exactly
+    const bool on = isOn(st);
+    const bool tin = tiedOut(st - 1), tout = tiedOut(st);
+    cuts[i].size   = b - a;
+    cuts[i].offset = a;            // play this step's own audio: nothing is rearranged
+    cuts[i].length = on ? (tout ? (b - a) : long(double(b - a) * dutycycle)) : 0; // the gate gap only ends a slice
+    cuts[i].tiedin = tin;
+    cuts[i].tiedout = tout;
+    // a tied run keeps one level
+    cuts[i].amp    = (tin && i > 0) ? cuts[i - 1].amp : Math::randomfloat(minamp, maxamp);
+    cuts[i].pan    = 0.f;
+    cuts[i].cents  = 0.f;          // a pitched step would need audio that has not arrived yet
+    cuts[i].step   = st;
+    cuts[i].envattack = Attack(st);
+    cuts[i].envdecay  = Decay(st);
+    cuts[i].envtension = Tension(st);
+    open += on ? 1 : 0;
+  }
+  lastkind = kBlockGate;
+  lastinfo[0] = open;
+  lastinfo[1] = n;
+  lastinfo[2] = mode;
+}
+
+//-------------------------------------------------------------------------------
+// Merges cuts shorter than minsize into their neighbours. Total block length is
+// preserved, so the rhythm stays on the grid, the repeats just get slower.
+//-------------------------------------------------------------------------------
+static void EnforceMinCut(std::vector<CutInfo> &cuts, long minsize)
+{
+  if(minsize <= 0 || cuts.size() < 2)
+    return;
+
+  const long threshold = long(minsize * 0.95);
+  bool anyshort = false;
+  for(size_t i = 0; i < cuts.size(); ++i)
+    if(cuts[i].size < threshold) { anyshort = true; break; }
+  if(!anyshort)
+    return;
+
+  std::vector<CutInfo> out;
+  out.reserve(cuts.size());
+  CutInfo acc;
+  double accduty = 1.0;
+  bool open = false;
+
+  for(size_t i = 0; i < cuts.size(); ++i)
+  {
+    if(!open)
+    {
+      acc = cuts[i];
+      accduty = acc.size > 0 ? double(acc.length) / double(acc.size) : 1.0;
+      open = true;
+    }
+    else
+    {
+      acc.size += cuts[i].size;
+    }
+    if(acc.size >= threshold)
+    {
+      acc.length = long(double(acc.size) * accduty);
+      out.push_back(acc);
+      open = false;
+    }
+  }
+
+  if(open)
+  {
+    if(out.empty())
+    {
+      acc.length = long(double(acc.size) * accduty);
+      out.push_back(acc);
+    }
+    else
+    {
+      CutInfo &back = out.back();
+      const double duty = back.size > 0 ? double(back.length) / double(back.size) : 1.0;
+      back.size += acc.size;
+      back.length = long(double(back.size) * duty);
+    }
+  }
+
+  cuts.swap(out);
+}
+
+//-------------------------------------------------------------------------------
 ListenerManager::ListenerManager()	{}
 
 void ListenerManager::OnPhrase(long bar, long sd)
@@ -515,6 +872,8 @@ LivePlayer::LivePlayer()
 , rl(0.f)
 , rr(0.f)
 , fade(0)
+, lastgain(0.f)
+, curpitched(false)
 , L(&inputbufferL)
 , R(&inputbufferR)
 , listenermanager(NULL)
@@ -556,8 +915,9 @@ void LivePlayer::OnBlock(std::vector<CutInfo> newcuts)
     
     long maxcutlength=0;
     for(int i=0;i<cuts.size();i++)
-      if(cuts[i].size>maxcutlength)
-        maxcutlength = cuts[i].size;
+      if(cuts[i].offset+cuts[i].size>maxcutlength)
+        maxcutlength = cuts[i].offset+cuts[i].size;
+    curpitched = false;
     
     inputbufferL.resize(maxcutlength,0.f);
     inputbufferR.resize(maxcutlength,0.f);
@@ -592,12 +952,17 @@ BBCutter::BBCutter(LivePlayer &player)
 , unitsinsideblock(0)
 , barsinsample(1)
 , slicestart(0)
+, mincutquarters(0.0)
+, phraselimit(0)
 , strategy(&cutproc11)
 {
   procs.reserve(kNumCutProcs);
   procs.push_back(&cutproc11);
   procs.push_back(&warpcutproc);
   procs.push_back(&sqpusher);
+  procs.push_back(&euclid);
+  procs.push_back(&ratchet);
+  procs.push_back(&gate);
   
   player.SetListenerManager(&listenermanager);
 }
@@ -622,7 +987,22 @@ void	BBCutter::SetCutProc(long i)
 
 void	BBCutter::SetBarsInSample(long bars) { barsinsample = bars; UpdateRates(); }
 void	BBCutter::SetTempo(double v) { tempo=v; UpdateRates(); }
-void	BBCutter::SetSubdiv(long v) { subdiv = v; UpdateRates(); }
+// A new subdivision mid-phrase: the phrase keeps its bars, its unit counts move to the new grid (otherwise its
+// length is no longer a whole number of bars and it never lines up with the bar again), and the block that was cut
+// on the old grid is replaced at the next unit.
+void	BBCutter::SetSubdiv(long v)
+{
+  if(v > 0 && subdiv > 0 && v != subdiv && totalunits > 0)
+  {
+    const double f = double(v) / double(subdiv);
+    const long bars = (totalunits + subdiv - 1) / subdiv;
+    totalunits = bars * v;
+    unitsdone = std::max(0L, std::min(totalunits, long(std::floor(double(unitsdone) * f + 0.5))));
+    unitsinsideblock = unitsinblock; // new block at the next unit
+  }
+  subdiv = v;
+  UpdateRates();
+}
 void	BBCutter::SetStutterChance(float chance)  { cutproc11.SetStutterChance(chance);}
 void	BBCutter::SetStutterArea(float area)      { cutproc11.SetStutterArea(area);}
 void	BBCutter::SetMaxRepeats(long repeats)     { cutproc11.SetMaxRepeats(repeats);}
@@ -632,6 +1012,11 @@ void	BBCutter::SetRegularChance(float chance)  { warpcutproc.SetRegularChance(ch
 void	BBCutter::SetRitardChance(float chance)   { warpcutproc.SetRitardChance(chance);}
 void	BBCutter::SetAccel(float v)               { warpcutproc.SetAccel(v);}
 void	BBCutter::SetActivity(float v)            { sqpusher.SetActivity(v);}
+void	BBCutter::SetEuclidDensity(float v)     { euclid.SetDensity(v);}
+void	BBCutter::SetEuclidChance(float v)      { euclid.SetChance(v);}
+void	BBCutter::SetEuclidSlice(long v)        { euclid.SetSlice(v);}
+void	BBCutter::SetRatchetIntensity(float v)  { ratchet.SetIntensity(v);}
+void	BBCutter::SetRatchetCurve(float v)      { ratchet.SetCurve(v);}
 void	BBCutter::SetFade(float v)                { player.SetFade( ms2samples(v,sr) );}
 void	BBCutter::SetMinPhraseLength(long v) { for_each(procs.begin(),procs.end(),bind2nd(mem_fun(&CutProc::SetMinPhraseLength),v));}
 void	BBCutter::SetMaxPhraseLength(long v) { for_each(procs.begin(),procs.end(),bind2nd(mem_fun(&CutProc::SetMaxPhraseLength),v));}
@@ -686,6 +1071,8 @@ void	BBCutter::UpdateRates()
 void	BBCutter::Phrase(long bar, long sd)
 {
   barsnow = strategy->ChoosePhraseLength();
+  if(phraselimit > 0 && barsnow > phraselimit)
+    barsnow = phraselimit;
   totalunits = barsnow*subdiv;
   unitsdone = 0;
   
@@ -698,6 +1085,9 @@ void	BBCutter::Block(long bar,long sd)
   std::vector<CutInfo> cuts;
   strategy->ChooseCuts(cuts,unitsinblock,
                        unitsdone,totalunits,subdiv,SamplesPerUnit());
+  // (the gate's steps are its grid: merging them would move the pattern)
+  if(mincutquarters > 0.0 && tempo > 0.0 && strategy != &gate)
+    EnforceMinCut(cuts, long(mincutquarters * sr * 60.0 / tempo));
   player.OnBlock(cuts);
   
   listenermanager.OnBlock(bar,sd);
@@ -705,6 +1095,14 @@ void	BBCutter::Block(long bar,long sd)
 
 void	BBCutter::Unit(long bar, long sd)
 {
+  // safety net: a phrase whose remaining length is not whole bars can never end on a bar line; restart it on one
+  if(sd == 0 && totalunits > 0 && unitsdone >= 0 && unitsdone < totalunits && subdiv > 0
+     && ((totalunits - unitsdone) % subdiv) != 0)
+  {
+    totalunits = 0;
+    unitsinsideblock = unitsinblock;
+  }
+
   if( totalunits<=0 || unitsdone>=totalunits || unitsdone<0 ) //out of phrase bounds and start of a bar
   {
     if(sd == 0)

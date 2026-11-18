@@ -46,6 +46,12 @@ void Comb::OnBlock(long bar, long sd)
 void Comb::OnCut(long cut, long numcuts)
 {
   delay = (startdelay + (float(cut)/float(numcuts))*enddelay)*sr/1000.f;
+  if(tuneMask != 0 && sr > 0.f)
+  {
+    // snap the loop period to a note; the feedback loop runs one sample longer than the delay line
+    const double period = lvcTunedPeriod(double(delay) / sr, tuneMask, tuneRef) * sr;
+    delay = float(std::max(1.0, type == FeedBack ? period - 1.0 : period));
+  }
   if(type==FeedForward) // feedforward
   {
     dl1.set_delay(delay);

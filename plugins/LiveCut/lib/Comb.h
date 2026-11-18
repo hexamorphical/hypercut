@@ -23,6 +23,7 @@
 #include "BBCutter.h"
 #include "DelayLine.h"
 #include "FirstOrderLowpass.h"
+#include "NoteTuning.h"
 
 inline float clip(float x)
 {
@@ -48,7 +49,10 @@ public:
 	void SetType(long v);
 	void SetFeedBack(float v);
 	void SetSampleRate(float v);
+	float GetDelayMs() const { return sr > 0.f ? delay * 1000.f / sr : 0.f; }
 	void SetOn(bool v);
+	// delay tuning: each slice's delay snaps to the period of the nearest note of the scale (mask 0 = off)
+	void SetTuning(uint16_t pitchClasses, double refA4) { tuneMask = pitchClasses; tuneRef = refA4; }
   
 	inline void tick(float &out1,float &out2, const float in1, const float in2)
 	{
@@ -86,6 +90,8 @@ private:
 	FirstOrderLowpass lp;
 	bool on;
 	long type;
+	uint16_t tuneMask = 0;
+	double tuneRef = 440.0;
 };
 
 #endif
