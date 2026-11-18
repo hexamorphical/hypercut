@@ -4,8 +4,9 @@
 
 <p align="center">
   <b>Real-time audio slicer, spectral pitchmapping and trance gate runnig inside a complex sequencer</b><br>
-  
+  <p align="center">
   VST3 · CLAP · LV2 · VST2 · JACK standalone
+  </p>
 </p>
 
 <p align="center">
