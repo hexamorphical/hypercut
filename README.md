@@ -57,8 +57,8 @@ The full git history of Livecut and the DPF port is kept in this repository.
 
 ## Download and install
 
-Get the latest build for your system from the [Releases page](https://github.com/hexamorphical/hypercut/releases) and
-unzip the format your DAW uses into its plugin folder:
+Download the zip for your system from the [Releases page](https://github.com/hexamorphical/hypercut/releases). Each zip
+has every format; copy the one your DAW uses into its plugin folder:
 
 | Format | Linux | Windows | macOS |
 | --- | --- | --- | --- |
