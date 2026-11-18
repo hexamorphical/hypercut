@@ -3,7 +3,8 @@
 </p>
 
 <p align="center">
-  <b>A live beat slicer, trance gate and glitch multi-effect</b><br>
+  <b>Real-time audio slicer, spectral pitchmapping and trance gate runnig inside a complex sequencer</b><br>
+  
   VST3 · CLAP · LV2 · VST2 · JACK standalone
 </p>
 
