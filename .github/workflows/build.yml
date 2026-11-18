@@ -1,0 +1,130 @@
+# Builds HyperCut for Linux, Windows and macOS.
+#
+# - Every push to master and every pull request: build all three, keep the zips as workflow artifacts.
+# - Pushing a tag like v0.2-beta: also publish the zips to that release (created as a pre-release if missing).
+# - Run it by hand (Actions > build > Run workflow) with a release tag to (re)upload the zips to an existing release.
+
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Upload the builds to this release (e.g. v0.1-beta). Leave empty to only build.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  # names the zips: the tag for releases, otherwise dev-<commit>
+  VERSION: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || format('dev-{0}', github.sha) }}
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    # built on Ubuntu 22.04 (glibc 2.35) so the binaries also load on older distributions
+    container: ubuntu:22.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+            build-essential git ca-certificates pkg-config zip \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxrandr-dev libdbus-1-dev
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build
+        run: make -j"$(nproc)"
+      - name: Package
+        run: bash scripts/package.sh "${VERSION:0:24}" linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hypercut-linux-x86_64
+          path: dist/*.zip
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Keep LF line endings (shell scripts and makefiles)
+        shell: pwsh
+        run: git config --global core.autocrlf false
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git make zip
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build
+        run: make -f Makefile-windows -j"$(nproc)"
+      - name: Package
+        run: bash scripts/package.sh "${VERSION:0:24}" windows-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hypercut-windows-x64
+          path: dist/*.zip
+
+  macos:
+    name: macOS universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build (Intel + Apple Silicon, macOS 10.15+)
+        run: make macos-universal-10.15 -j"$(sysctl -n hw.ncpu)"
+      - name: Ad-hoc sign
+        # no Apple developer certificate: an ad-hoc signature keeps Apple Silicon happy; users still have to
+        # clear the download quarantine (see the README)
+        run: |
+          for b in bin/HyperCut.vst3 bin/HyperCut.clap bin/HyperCut.vst bin/HyperCut.app; do
+            codesign --force --deep --sign - "$b"
+          done
+          codesign --force --sign - bin/HyperCut.lv2/HyperCut.dylib
+      - name: Package
+        run: bash scripts/package.sh "${VERSION:0:24}" macos-universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hypercut-macos-universal
+          path: dist/*.zip
+
+  release:
+    name: Publish to the release
+    needs: [linux, windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum ./*.zip > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+              --title "HyperCut $TAG" --notes "Builds for Linux, Windows and macOS. See the README for installing."
+          fi
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

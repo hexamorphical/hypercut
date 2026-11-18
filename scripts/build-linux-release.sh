@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the Linux x86_64 release binaries so they also run on older distributions (glibc 2.35+), then packages
-# every format into dist/. Usage: scripts/build-linux-release.sh <version>   e.g. scripts/build-linux-release.sh v0.1-beta
+# every format into dist/ (the GitHub Actions workflow builds all platforms the same way). Usage: scripts/build-linux-release.sh <version>   e.g. scripts/build-linux-release.sh v0.1-beta
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VERSION="${1:?usage: $0 <version>}"
@@ -18,17 +18,6 @@ if [ "$(printf '%s\n' "$max" GLIBC_2.35 | sort -V | tail -1)" != GLIBC_2.35 ]; t
     exit 1
 fi
 
-# zip, or bsdtar where zip is not installed
-mkzip() { local dst="$1"; shift; if command -v zip >/dev/null; then zip -qr "$dst" "$@"; else bsdtar --format zip -cf "$dst" "$@"; fi; }
-
-out="dist"
-base="HyperCut-$VERSION-linux-x86_64"
-rm -rf "$out" && mkdir -p "$out"
-(cd bin && mkzip "../$out/$base-vst3.zip" HyperCut.vst3)
-(cd bin && mkzip "../$out/$base-clap.zip" HyperCut.clap)
-(cd bin && mkzip "../$out/$base-lv2.zip" HyperCut.lv2)
-(cd bin && mkzip "../$out/$base-vst2.zip" HyperCut-vst.so)
-(cd bin && mkzip "../$out/$base-standalone.zip" HyperCut)
-(cd bin && mkzip "../$out/$base-all.zip" HyperCut.vst3 HyperCut.clap HyperCut.lv2 HyperCut-vst.so HyperCut)
-(cd "$out" && sha256sum ./*.zip > SHA256SUMS.txt)
-ls -la "$out"
+rm -rf dist
+scripts/package.sh "$VERSION" linux-x86_64
+(cd dist && sha256sum ./*.zip > SHA256SUMS.txt)
