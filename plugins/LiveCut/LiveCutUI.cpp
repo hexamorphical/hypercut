@@ -1603,9 +1603,9 @@ protected:
 
     void setParamGesture(uint32_t i, float v)
     {
-        editParameter(i, true);
+        // Ableton ignores a begin/perform/end gesture collapsed into one message batch,
+        // so one-shot parameter changes go through setParameterValue alone.
         setParam(i, v);
-        editParameter(i, false);
     }
 
     // the gate has its own switch; the other algorithms are values of LVC_CUTPROC
