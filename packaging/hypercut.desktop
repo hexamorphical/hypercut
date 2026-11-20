@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=HyperCut
+Comment=Beat slicer plugin and standalone
+Exec=HyperCut
+Icon=hypercut
+Categories=AudioVideo;Audio;Music;
+Terminal=false

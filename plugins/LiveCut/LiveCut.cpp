@@ -42,6 +42,7 @@
 #include "BitCrusher.h"
 #include "Comb.h"
 #include "EchoDelay.h"
+#include "DelaySlice.h"
 #include "SVFilter.h"
 #include "Limiter.h"
 #include "SliceFilter.h"
@@ -53,6 +54,8 @@
 #include <cstdio>
 
 START_NAMESPACE_DISTRHO
+
+static_assert(LVC_CONTROL_NR <= LiveCutVis::kMaxParams, "LiveCutVis::kMaxParams must cover every parameter ID");
 
 // -----------------------------------------------------------------------------------------------------------
 
@@ -90,6 +93,7 @@ public:
         visListener.self = this;
         bbcutter.RegisterListener(&crusher);
         bbcutter.RegisterListener(&comb);
+        bbcutter.RegisterListener(&delaySlice);
         bbcutter.RegisterListener(&sliceFilter);
         bbcutter.RegisterListener(&reverbSends);
         bbcutter.RegisterListener(&visListener);
@@ -190,6 +194,58 @@ public:
         vis.endPhraseWrite();
 
         ++blockCounter;
+    }
+
+    // Publish the value currently selected for every min/max slider, so the UI can mark it on the track.
+    void visPublishCurrentValues()
+    {
+        auto put = [&](int idx, float value) {
+            if (idx >= 0 && idx < LiveCutVis::kMaxParams)
+            {
+                vis.paramCurrent[idx] = value;
+                vis.paramCurrentValid[idx] = 1;
+            }
+        };
+
+        const int32_t sub = vis.phrase.subdiv > 0 ? vis.phrase.subdiv : 1;
+        put(LVC_MINPHRS, static_cast<float>(vis.phrase.totalUnits) / static_cast<float>(sub));
+
+        const int cb = vis.currentBlock.load(std::memory_order_relaxed);
+        if (cb >= 0 && cb < vis.phrase.numBlocks)
+            put(LVC_MINREP, static_cast<float>(vis.phrase.blocks[cb].info[1]));
+        const int cc = vis.currentCut.load(std::memory_order_relaxed);
+        if (cc >= 0 && cc < vis.phrase.numCuts)
+        {
+            put(LVC_MINAMP,   vis.phrase.cuts[cc].amp);
+            put(LVC_MINPAN,   vis.phrase.cuts[cc].pan);
+            put(LVC_MINPITCH, vis.phrase.cuts[cc].cents);
+        }
+
+        put(LVC_LPMIN,    std::exp(lpSmooth));
+        put(LVC_HPFREQ,   sliceFilter.Highpass());
+        put(LVC_MINBITS,  crusher.GetBits());
+        put(LVC_MINFREQ,  crusher.GetFreq());
+        put(LVC_MINDELAY, comb.GetDelayMs());
+        put(LVC_RVSENDMIN,  reverbSends.Send());
+        put(LVC_RVDECAYMIN, reverbSends.Decay());
+        put(LVC_MINFEEDBACK, delaySlice.Feedback());
+        put(LVC_MINDLYMIX,   delaySlice.Mix());
+
+        // REGION is not randomised: mark the loudest detected note (in Hz), or the middle of the range in silence.
+        float best = -1.f;
+        int bestNote = -1;
+        for (int n = 0; n < LiveCutVis::kChromaNotes; ++n)
+        {
+            const float level = vis.chromaDry[n] + vis.chromaTuned[n];
+            if (level > best) { best = level; bestNote = n; }
+        }
+        if (best > 1e-4f && bestNote >= 0)
+        {
+            const double refA4 = lvcTuneRefA4(control[LVC_CHTUNE]);
+            put(LVC_CHLOW, static_cast<float>(refA4 * std::pow(2.0, (bestNote - 69) / 12.0)));
+        }
+        else
+            put(LVC_CHLOW, 0.5f * (control[LVC_CHLOW] + control[LVC_CHHIGH]));
     }
 
 protected:
@@ -553,6 +609,14 @@ protected:
             setEnum(parameter, labels, 2);
             break;
         }
+        case LVC_DLYROUTE:
+        {
+            static const char* const labels[2] = { "Insert", "Send" };
+            parameter.hints |= kParameterIsInteger;
+            parameter.name = "Delay Route";
+            setEnum(parameter, labels, 2);
+            break;
+        }
         case LVC_DLYSYNC:
             parameter.name = "Delay Sync";
             parameter.hints |= kParameterIsBoolean;
@@ -585,6 +649,8 @@ protected:
             parameter.name = "Delay Tune To Scale";
             parameter.hints |= kParameterIsBoolean;
             break;
+        case LVC_MINFEEDBACK: parameter.name = "Delay Feedback Min"; break;
+        case LVC_MINDLYMIX:   parameter.name = "Delay Mix Min"; break;
         case LVC_GATELP:      parameter.name = "Gate Lowpass Depth"; break;
         case LVC_GATEHP:      parameter.name = "Gate Highpass Depth"; break;
         case LVC_GATEVARY:    parameter.name = "Gate Variation"; break;
@@ -689,9 +755,29 @@ protected:
             comb.SetOn(control[LVC_COMB] > 0.5f && control[LVC_DLYMODE] <= 0.5f); // the echo has its own path
             break;
         case LVC_TYPE:     comb.SetType(static_cast<long>(control[i])); break;
-        case LVC_FEEDBACK: comb.SetFeedBack(control[i]); break; // the echo reads it in run()
         case LVC_MINDELAY: comb.SetMinDelay(control[i]); break;
         case LVC_MAXDELAY: comb.SetMaxDelay(control[i]); break;
+        // Feedback and amount are min/max ranges: each slice gets a random value inside them.
+        case LVC_FEEDBACK: case LVC_MINFEEDBACK:
+            delaySlice.SetFeedbackRange(control[LVC_MINFEEDBACK], control[LVC_FEEDBACK]);
+            break;
+        case LVC_DLYMIX: case LVC_MINDLYMIX:
+            delaySlice.SetMixRange(control[LVC_MINDLYMIX], control[LVC_DLYMIX]);
+            break;
+        case LVC_DLYROUTE:
+        {
+            const bool insert = control[i] > 0.5f;
+            if (insert != delayInsert)
+            {
+                echo.Restart(); // a routing switch starts from silence, not an old tail
+                dlyWetSmooth = 0.f;
+                dlyDrySmooth = 1.f;
+                dlySendSmooth = 0.f;
+                dlyOnSmooth = 0.f;
+                delayInsert = insert;
+            }
+            break;
+        }
         case LVC_SEED:     Math::randomseed(static_cast<long>(control[i])); break;
         case LVC_LIMITER:  limiter.setEnabled(control[i] > 0.5f); break;
         case LVC_LIMCEIL:  limiter.setCeilingDb(control[i]); break;
@@ -776,9 +862,14 @@ protected:
         highpass.reset();
         masterLowpass.setSampleRate(sampleRate);
         echo.SetSampleRate(sampleRate); // allocates the delay buffers
-        echoWetSmooth = 0.f;
-        echoDrySmooth = 1.f;
+        dlyWetSmooth = 0.f;
+        dlyDrySmooth = 1.f;
+        dlyOnSmooth = 0.f;
+        dlySendSmooth = 0.f;
         echoIdle = true;
+        delayInsert = control[LVC_DLYROUTE] > 0.5f;
+        delayFbSmooth = control[LVC_FEEDBACK];
+        delayMixSmooth = control[LVC_DLYMIX];
         gateLowpass.setSampleRate(sampleRate);
         gateHighpass.setSampleRate(sampleRate);
         gateLowpass.reset();
@@ -1071,7 +1162,6 @@ protected:
             else
                 echo.SetTimes(tl * sampleRate, tr * sampleRate);
             echo.SetMode(limit<int>(static_cast<int>(control[LVC_DLYSTEREO] + 0.5f), 0, 2));
-            echo.SetFeedback(control[LVC_FEEDBACK]);
             echo.SetTone(control[LVC_DLYTONE]);
             if (echoOn && echoIdle)
             {
@@ -1079,11 +1169,6 @@ protected:
                 echoIdle = false;
             }
         }
-        // mix law: the dry stays full up to 50 %, the wet reaches full at 50 %
-        const float echoMix = limit<float>(control[LVC_DLYMIX], 0.f, 1.f);
-        const float echoWetTarget = echoOn ? std::min(1.f, 2.f * echoMix) : 0.f;
-        const float echoDryTarget = echoOn ? std::min(1.f, 2.f * (1.f - echoMix)) : 1.f;
-
         // ---- parameter targets ----
         const bool gateOn = control[LVC_GATE] > 0.5f;
         gateLpTarget = gateOn ? control[LVC_GATELP] : 0.f;
@@ -1209,8 +1294,21 @@ protected:
             }
 
             transOnSmooth += smoothCoef * (transTarget - transOnSmooth);
-            echoWetSmooth += smoothCoef * (echoWetTarget - echoWetSmooth);
-            echoDrySmooth += smoothCoef * (echoDryTarget - echoDrySmooth);
+            // Feedback and amount follow the value chosen for the current slice, lightly smoothed.
+            delayFbSmooth  += smoothCoef * (delaySlice.Feedback() - delayFbSmooth);
+            delayMixSmooth += smoothCoef * (delaySlice.Mix() - delayMixSmooth);
+            dlyOnSmooth += smoothCoef * ((control[LVC_COMB] > 0.5f ? 1.f : 0.f) - dlyOnSmooth);
+            // SEND: AMOUNT is the level fed into a parallel tail. INSERT: AMOUNT is the dry/wet crossfade.
+            dlySendSmooth += smoothCoef * (((control[LVC_COMB] > 0.5f && ! delayInsert) ? delayMixSmooth : 0.f) - dlySendSmooth);
+            float dlySendL = 0.f, dlySendR = 0.f, dlyWetL = 0.f, dlyWetR = 0.f;
+            // mix law: the dry stays full up to 50 %, the wet reaches full at 50 %
+            const float dlyMixNow = limit<float>(delayMixSmooth, 0.f, 1.f);
+            const float dlyInsertWet = std::min(1.f, 2.f * dlyMixNow);
+            const float dlyInsertDry = std::min(1.f, 2.f * (1.f - dlyMixNow));
+            const float dlyWetTarget = delayInsert ? dlyOnSmooth * dlyInsertWet : 0.f;
+            const float dlyDryTarget = delayInsert ? 1.f - dlyOnSmooth * (1.f - dlyInsertDry) : 1.f;
+            dlyWetSmooth += smoothCoef * (dlyWetTarget - dlyWetSmooth);
+            dlyDrySmooth += smoothCoef * (dlyDryTarget - dlyDrySmooth);
 
             // fill gate: outside the fill the output is dry (smoothed to avoid clicks)
             gateSmooth += gateCoef * ((fillOn && ! fillZoneActive ? 0.f : 1.f) - gateSmooth);
@@ -1245,15 +1343,49 @@ protected:
                     crusher.tick(l, r, l, r);
                     break;
                 case kFxComb:
-                    if (echoMode || echoWetSmooth > 1e-5f || echoDrySmooth < 0.99999f)
+                {
+                    if (delayInsert)
                     {
-                        // ECHO mode (also while it fades out after switching off or back to the comb)
-                        if (echoOn || echoWetSmooth > 1e-5f || echoDrySmooth < 0.99999f)
-                            echo.process(l, r, echoDrySmooth, echoWetSmooth);
+                        // INSERT: the delay sits in the slice path, crossfaded by the AMOUNT slider.
+                        if (echoMode)
+                        {
+                            if (echoOn || dlyWetSmooth > 1e-5f || dlyDrySmooth < 0.99999f)
+                            {
+                                echo.SetFeedback(delayFbSmooth);
+                                echo.process(l, r, dlyDrySmooth, dlyWetSmooth);
+                            }
+                        }
+                        else
+                        {
+                            const float inL = l, inR = r;
+                            comb.SetFeedBack(delayFbSmooth);
+                            comb.tick(l, r, l, r);
+                            if (dlyWetSmooth > 1e-5f || dlyDrySmooth < 0.99999f)
+                            {
+                                l = inL * dlyDrySmooth + l * dlyWetSmooth;
+                                r = inR * dlyDrySmooth + r * dlyWetSmooth;
+                            }
+                        }
                     }
-                    if (! echoMode)
-                        comb.tick(l, r, l, r);
+                    else if (dlyOnSmooth > 1e-4f)
+                    {
+                        // SEND: tap the slice into a parallel delay and leave the dry path untouched.
+                        // The tail is added after the global mix, so it can ring over the dry part.
+                        const float sg = dlySendSmooth * gateSmooth;
+                        dlySendL = l * sg;
+                        dlySendR = r * sg;
+                        if (echoMode)
+                        {
+                            echo.SetFeedback(delayFbSmooth);
+                            echo.process(dlySendL, dlySendR, 0.f, 1.f);
+                            dlyWetL = dlySendL;
+                            dlyWetR = dlySendR;
+                        }
+                        else
+                            comb.tick(dlyWetL, dlyWetR, dlySendL, dlySendR);
+                    }
                     break;
+                }
                 case kFxFilter:
                 {
                     float fl = l, fr = r;
@@ -1356,12 +1488,17 @@ protected:
             float oL = mixDryL + wet * (l - mixDryL);
             float oR = mixDryR + wet * (r - mixDryR);
 
-            // send-mode tail is added after the gate so it can ring over the dry part
+            // send-mode tails are added after the gate so they can ring over the dry part
             if (! reverbInsert && revOnSmooth > 1e-4f)
             {
                 reverb.process(revSendL, revSendR, revL, revR);
                 oL += mixSmooth * revOnSmooth * revL;
                 oR += mixSmooth * revOnSmooth * revR;
+            }
+            if (! delayInsert && dlyOnSmooth > 1e-4f)
+            {
+                oL += mixSmooth * dlyOnSmooth * dlyWetL;
+                oR += mixSmooth * dlyOnSmooth * dlyWetR;
             }
 
             // master tone shaping: the filters always run, so moving the knob never jumps their state.
@@ -1400,6 +1537,7 @@ protected:
 
             if (++scopeCount >= samplesPerColumn)
             {
+                visPublishCurrentValues();
                 const uint32_t w = vis.scopeWrite.load(std::memory_order_relaxed);
                 const uint32_t c = w % LiveCutVis::kScopeColumns;
                 vis.scopeMin[c] = scopeMinAcc;
@@ -1418,6 +1556,7 @@ protected:
                 vis.scopeRate[c] = crusher.GetFreq();
                 vis.scopeComb[c] = echoMode ? 0.f : comb.GetDelayMs(); // the lane shows the comb's per-slice delay
                 vis.scopeLP[c]   = std::exp(lpSmooth) * (filterMix > 0.5f ? 1.f : -1.f); // negative = filter off
+                vis.scopeHP[c]   = sliceFilter.Highpass(); // current per-slice highpass, for the filter panel's curve
                 vis.scopeVerb[c] = scopeVerbAcc;
                 scopeVerbAcc = 0.f;
                 scopeEnvAcc = 0.f;
@@ -1436,10 +1575,10 @@ protected:
         }
 
         // echo fully faded out: the next switch-on restarts it from silence
-        if (! echoOn && echoWetSmooth < 1e-5f && echoDrySmooth > 0.99999f)
+        if (! echoOn && dlyWetSmooth < 1e-5f && dlyDrySmooth > 0.99999f)
         {
-            echoWetSmooth = 0.f;
-            echoDrySmooth = 1.f;
+            dlyWetSmooth = 0.f;
+            dlyDrySmooth = 1.f;
             echoIdle = true;
         }
 
@@ -1653,9 +1792,13 @@ private:
     float cutoffCoef = 0.01f;
     SliceFilter sliceFilter;
 
-    // delay module, ECHO mode
+    // delay module: per-slice feedback / amount, the routing switch, and the echo delay line
+    SliceDelay delaySlice;
+    float delayFbSmooth = 0.5f, delayMixSmooth = 0.35f;
+    bool delayInsert = true; // 0 = SEND (parallel tail), 1 = INSERT (in the slice path)
+    float dlyOnSmooth = 0.f, dlySendSmooth = 0.f;
     EchoDelay echo;
-    float echoWetSmooth = 0.f, echoDrySmooth = 1.f;
+    float dlyWetSmooth = 0.f, dlyDrySmooth = 1.f; // insert crossfade (both comb and echo)
     bool echoIdle = true;
 
     // trance gate filter (right after the slicer, follows the gate envelope)

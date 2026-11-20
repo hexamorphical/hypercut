@@ -286,7 +286,8 @@ static ParamSpec specFor(uint32_t i)
     case LVC_CHPOS: case LVC_CHKEY: case LVC_CHSCALE: case LVC_TRPOS: return { kMapInt, 1.f, kFmtInt };
     case LVC_DLYTIMEL: case LVC_DLYTIMER: return { kMapInt, 1.f, kFmtDiv };
     case LVC_DLYMSL: case LVC_DLYMSR: return { kMapLog, 1.f, kFmtMs };
-    case LVC_DLYMODE: case LVC_DLYSYNC: case LVC_DLYSTEREO: case LVC_DLYTUNE: return { kMapInt, 1.f, kFmtInt };
+    case LVC_DLYMODE: case LVC_DLYSYNC: case LVC_DLYSTEREO: case LVC_DLYTUNE:
+    case LVC_DLYROUTE: return { kMapInt, 1.f, kFmtInt };
     default:           return { kMapLin, 1.f, kFmtPct };
     }
 }
@@ -661,6 +662,9 @@ static bool readPresetFile(const std::string& path, std::string& name, std::stri
     std::fclose(f);
     if (seen[LVC_LPFREQ] && ! seen[LVC_LPMIN]) out[LVC_LPMIN] = out[LVC_LPFREQ];
     if (seen[LVC_HPFREQ] && ! seen[LVC_HPMAX]) out[LVC_HPMAX] = out[LVC_HPFREQ];
+    // Old presets have a single feedback / mix value - keep the old sound by using it as both bounds.
+    if (seen[LVC_FEEDBACK] && ! seen[LVC_MINFEEDBACK]) out[LVC_MINFEEDBACK] = out[LVC_FEEDBACK];
+    if (seen[LVC_DLYMIX] && ! seen[LVC_MINDLYMIX]) out[LVC_MINDLYMIX] = out[LVC_DLYMIX];
     return true;
 }
 
@@ -770,6 +774,27 @@ class HyperCutUI : public UI
     ViewZoom zBuf, zMap, zScope;
 
     float transMeter = 0.f; // transient shaper gain meter, held for display
+
+    // Smoothed UI copies of the per-slice effect values written to the scope by the DSP.
+    // These drive the little insets in the filter and crush panels (like the docs' visualisations).
+    float fxViewBits = 32.f, fxViewRate = 44100.f, fxViewLP = 20000.f, fxViewHP = 20.f;
+
+    // Smoothed current values for the selected-value marker on every min/max range slider.
+    float rangeCurSmooth[LiveCutVis::kMaxParams] {};
+    bool  rangeCurInit[LiveCutVis::kMaxParams] {};
+
+    // The DSP publishes the per-slice value for each range pair; return it for the UI marker.
+    // -1 means "not available" (no audio running yet).
+    float currentParamValue(uint32_t idx)
+    {
+        if (vis == nullptr || idx >= LiveCutVis::kMaxParams || ! vis->paramCurrentValid[idx])
+            return -1.f;
+        float& v = rangeCurSmooth[idx];
+        const float target = vis->paramCurrent[idx];
+        if (! rangeCurInit[idx]) { v = target; rangeCurInit[idx] = true; }
+        else v += 0.25f * (target - v);
+        return v;
+    }
 
     // CRT look of the visualisers: each screen is copied to a texture in the middle of ImGui's rendering and drawn
     // back curved, with phosphor ghosting, bloom, scanlines and grain (plain OpenGL 1.1 calls, no shaders)
@@ -1277,13 +1302,16 @@ protected:
             v[LVC_DLYTIMER] = divs[pick(divWeights, 6)];
             static const float stereoWeights[3] = { 1.f, 1.5f, 2.5f };
             v[LVC_DLYSTEREO] = static_cast<float>(pick(stereoWeights, 3));
-            v[LVC_FEEDBACK] = rnd(0.25f, 0.75f);
-            v[LVC_DLYMIX] = rnd(0.2f, 0.5f);
+            v[LVC_MINFEEDBACK] = rnd(0.05f, 0.45f);
+            v[LVC_FEEDBACK] = rnd(v[LVC_MINFEEDBACK] + 0.05f, 0.85f);
+            v[LVC_MINDLYMIX] = rnd(0.05f, 0.35f);
+            v[LVC_DLYMIX] = rnd(v[LVC_MINDLYMIX] + 0.05f, 0.6f);
             v[LVC_DLYTONE] = rnd(0.1f, 0.7f);
             return;
         }
         v[LVC_TYPE] = chance(0.5f) ? 1.f : 0.f;
-        v[LVC_FEEDBACK] = rnd(0.2f, 0.85f);
+        v[LVC_MINFEEDBACK] = rnd(0.1f, 0.5f);
+        v[LVC_FEEDBACK] = rnd(v[LVC_MINFEEDBACK] + 0.05f, 0.9f);
         v[LVC_MINDELAY] = rndLog(1.f, 20.f);
         v[LVC_MAXDELAY] = rndLog(v[LVC_MINDELAY], 40.f);
     }
@@ -2203,13 +2231,20 @@ protected:
         const float x0 = a.x + handleR, x1 = a.x + width - handleR;
 
         // label row
-        char bmin[24], bmax[24], val[64];
+        char bmin[24], bmax[24], base[64], val[96], cbuf[24] = "";
         formatValue(idxMin, pv[idxMin], bmin, sizeof(bmin));
         formatValue(idxMax, pv[idxMax], bmax, sizeof(bmax));
         if (std::strcmp(bmin, bmax) == 0)
-            std::snprintf(val, sizeof(val), "%s", bmin);
+            std::snprintf(base, sizeof(base), "%s", bmin);
         else
-            std::snprintf(val, sizeof(val), "%s  \xe2\x80\x93  %s", bmin, bmax); // en dash (UTF-8)
+            std::snprintf(base, sizeof(base), "%s  \xe2\x80\x93  %s", bmin, bmax); // en dash (UTF-8)
+        const float cur = currentParamValue(idxMin);
+        if (cur >= 0.f)
+            formatValue(idxMin, cur, cbuf, sizeof(cbuf));
+        if (cbuf[0])
+            std::snprintf(val, sizeof(val), "%s  (%s)", base, cbuf);
+        else
+            std::snprintf(val, sizeof(val), "%s", base);
 
         ImGui::SetCursorScreenPos(ImVec2(a.x, trackY - 11.f * s));
         ImGui::InvisibleButton("##range", ImVec2(width, 22.f * s));
@@ -2302,6 +2337,17 @@ protected:
             dl->AddCircle(c, handleR, U32(P.grad(n), hot ? 1.f : 0.85f), 24, hot ? 2.2f * s : 1.6f * s);
             if (hot)
                 dl->AddCircleFilled(c, handleR * 2.f, U32(P.grad(n), 0.15f), 24);
+        }
+
+        // selected per-slice value: thin needle + small triangle above the track
+        if (cur >= 0.f)
+        {
+            const float nc = std::max(0.f, std::min(1.f, toNorm(idxMin, cur)));
+            const float cx = x0 + (x1 - x0) * nc;
+            dl->AddLine(ImVec2(cx, trackY - 7.f * s), ImVec2(cx, trackY + 7.f * s), U32(P.text, 0.9f), 2.f * s);
+            dl->AddTriangleFilled(ImVec2(cx - 4.f * s, trackY - 12.f * s),
+                                  ImVec2(cx + 4.f * s, trackY - 12.f * s),
+                                  ImVec2(cx, trackY - 6.f * s), U32(P.a, 0.95f));
         }
 
         if (hovered || active)
@@ -5368,6 +5414,115 @@ protected:
     // Filter, crusher and delay each have their own panel, in signal-flow order. Their per-slice values are drawn at
     // random inside the ranges set here.
 
+    // Average the newest scope columns so the panel insets follow the current slice without flickering.
+    void readFxScope(float& bits, float& rate, float& lp, float& hp) const
+    {
+        bits = 32.f; rate = 44100.f; lp = 20000.f; hp = 20.f;
+        if (vis == nullptr)
+            return;
+        const uint32_t wr = vis->scopeWrite.load(std::memory_order_acquire);
+        if (wr == 0)
+            return;
+        float b = 0.f, r = 0.f, l = 0.f, h = 0.f;
+        int n = 0;
+        for (int i = 0; i < 8 && i < static_cast<int>(wr); ++i)
+        {
+            const uint32_t idx = (wr - 1u - static_cast<uint32_t>(i)) % static_cast<uint32_t>(LiveCutVis::kScopeColumns);
+            b += vis->scopeBits[idx];
+            r += vis->scopeRate[idx];
+            l += std::fabs(vis->scopeLP[idx]);
+            h += vis->scopeHP[idx];
+            ++n;
+        }
+        if (n == 0)
+            return;
+        bits = std::max(1.f, std::min(32.f, b / n));
+        rate = std::max(441.f, std::min(44100.f, r / n));
+        lp   = std::max(20.f, std::min(20000.f, l / n));
+        hp   = std::max(20.f, std::min(20000.f, h / n));
+    }
+
+    // Mini frequency-response plot: the same HP * LP shape (plus resonance bump) shown on the docs page,
+    // drawn from the cutoffs of the slice that is actually playing.
+    void drawFilterResponse(ImDrawList* dl, float x0, float x1, float y0, float y1, bool on)
+    {
+        const float alpha = on ? 1.f : 0.32f;
+        inset(dl, ImVec2(x0, y0), ImVec2(x1, y1), 8.f * s);
+        dl->PushClipRect(ImVec2(x0 + 1.f, y0 + 1.f), ImVec2(x1 - 1.f, y1 - 1.f), true);
+
+        const float xL = x0 + 5.f * s, xR = x1 - 5.f * s;
+        const float yT = y0 + 8.f * s, yB = y1 - 8.f * s;
+        dl->AddLine(ImVec2(xL, (yT + yB) * 0.5f), ImVec2(xR, (yT + yB) * 0.5f), U32(P.textFaint, 0.28f * alpha), 1.f);
+
+        const float kLog = std::log(1000.f);
+        const float lp = std::log(std::max(20.f, std::min(20000.f, fxViewLP)) / 20.f) / kLog;
+        const float hp = std::log(std::max(20.f, std::min(20000.f, fxViewHP)) / 20.f) / kLog;
+        const float reso = std::max(0.f, std::min(1.f, pv[LVC_RESO]));
+
+        ImVec2 pts[41];
+        for (int i = 0; i <= 40; ++i)
+        {
+            const float u = i / 40.f;
+            const float hpG = 1.f / (1.f + std::pow(hp / std::max(0.001f, u), 6.f));
+            const float lpG = 1.f / (1.f + std::pow(u / std::max(0.001f, lp), 6.f));
+            const float peak = 1.f + reso * 1.2f * std::exp(-std::pow((u - lp) * 25.f, 2.f));
+            const float v = std::min(1.35f, hpG * lpG * peak);
+            pts[i] = ImVec2(xL + (xR - xL) * u, yB - (yB - yT) * v / 1.35f);
+        }
+        dl->AddPolyline(pts, 41, U32(P.grad(0.5f), 0.14f * alpha), 0, 6.f * s);
+        for (int i = 0; i < 40; ++i)
+            dl->AddLine(pts[i], pts[i + 1], U32(P.grad(i / 40.f), 0.95f * alpha), std::max(1.f, 1.6f * s));
+        dl->PopClipRect();
+    }
+
+    // Tiny oscilloscope from the docs: a faint untouched sine behind the current quantised / sample-held
+    // version, with a live bit-depth readout.
+    void drawCrushScope(ImDrawList* dl, float x0, float x1, float y0, float y1, bool on)
+    {
+        const float alpha = on ? 1.f : 0.32f;
+        inset(dl, ImVec2(x0, y0), ImVec2(x1, y1), 8.f * s);
+        dl->PushClipRect(ImVec2(x0 + 1.f, y0 + 1.f), ImVec2(x1 - 1.f, y1 - 1.f), true);
+
+        const float xL = x0 + 6.f * s, xR = x1 - 6.f * s;
+        const float mid = (y0 + y1) * 0.5f, amp = (y1 - y0) * 0.5f - 12.f * s;
+        dl->AddLine(ImVec2(xL, mid), ImVec2(xR, mid), U32(P.textFaint, 0.22f * alpha), 1.f);
+
+        ImVec2 ref[49];
+        for (int i = 0; i <= 48; ++i)
+        {
+            const float u = i / 48.f;
+            ref[i] = ImVec2(xL + (xR - xL) * u, mid - std::sin(u * 4.f * IM_PI) * amp);
+        }
+        dl->AddPolyline(ref, 49, U32(P.textDim, 0.16f), 0, std::max(1.f, 1.f * s));
+
+        const float bits = std::max(1.f, std::min(32.f, fxViewBits));
+        const float levels = std::max(2.f, std::min(12.f, std::pow(2.f, std::min(bits, 16.f) / 4.f)));
+        const float rn = std::log(std::max(441.f, std::min(44100.f, fxViewRate)) / 441.f) / std::log(100.f);
+        const int points = std::max(4, std::min(38, static_cast<int>(8.f + 30.f * rn + 0.5f)));
+
+        ImVec2 stair[80];
+        float prevY = mid;
+        int nPts = 1;
+        stair[0] = ImVec2(xL, mid);
+        for (int i = 1; i <= points; ++i)
+        {
+            const float u = static_cast<float>(i) / points;
+            const float v = std::round(std::sin(u * 4.f * IM_PI) * levels) / levels;
+            const float y = mid - v * amp;
+            const float x = xL + (xR - xL) * u;
+            stair[nPts++] = ImVec2(x, prevY);
+            stair[nPts++] = ImVec2(x, y);
+            prevY = y;
+        }
+        dl->AddPolyline(stair, nPts, U32(P.grad(0.45f), 0.13f * alpha), 0, 5.f * s);
+        dl->AddPolyline(stair, nPts, U32(P.grad(0.7f), 0.95f * alpha), 0, std::max(1.f, 1.6f * s));
+
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%.0f bit", bits);
+        textRight(dl, fSmall, ImVec2(x1 - 6.f * s, y0 + 5.f * s), U32(P.textDim, alpha), buf);
+        dl->PopClipRect();
+    }
+
     void drawFilterPanel(ImDrawList* dl, ImVec2 a, ImVec2 b)
     {
         const float top = panel(dl, a, b, "FILTER");
@@ -5385,6 +5540,13 @@ protected:
         const float r = 19.f * s;
         const float ky = std::min(y + 20.f * s + r, b.y - 14.f * s - r - 32.f * s);
         knob(dl, LVC_RESO, "RESO", ImVec2((x0 + x1) * 0.5f, ky), r, on, false, w);
+
+        float bits = 0.f, rate = 0.f, lp = 0.f, hp = 0.f;
+        readFxScope(bits, rate, lp, hp);
+        fxViewLP += (lp - fxViewLP) * 0.3f;
+        fxViewHP += (hp - fxViewHP) * 0.3f;
+        const float ih = std::min(64.f * s, (b.y - a.y) * 0.18f);
+        drawFilterResponse(dl, x0, x1, b.y - 14.f * s - ih, b.y - 14.f * s, on);
     }
 
     void drawCrusherPanel(ImDrawList* dl, ImVec2 a, ImVec2 b)
@@ -5400,6 +5562,14 @@ protected:
         rangeSlider(dl, LVC_MINBITS, LVC_MAXBITS, "BITS", ImVec2(x0, y), w, false, on);
         y += 46.f * s;
         rangeSlider(dl, LVC_MINFREQ, LVC_MAXFREQ, "RATE", ImVec2(x0, y), w, false, on);
+
+        float bits = 0.f, rate = 0.f, lp = 0.f, hp = 0.f;
+        readFxScope(bits, rate, lp, hp);
+        fxViewBits += (bits - fxViewBits) * 0.35f;
+        fxViewRate += (rate - fxViewRate) * 0.35f;
+        const float ih = std::min(150.f * s, b.y - 14.f * s - (y + 12.f * s));
+        if (ih > 40.f * s)
+            drawCrushScope(dl, x0, x1, b.y - 14.f * s - ih, b.y - 14.f * s, on);
     }
 
     // delay module, ECHO mode: stereo mode, time (note values or ms), feedback / mix / tone
@@ -5431,7 +5601,7 @@ protected:
         segmented(dl, LVC_DLYSTEREO, st, 3, ImVec2(x0, y), ImVec2(x1, y + 22.f * s), on);
         if (ImGui::IsMouseHoveringRect(ImVec2(x0, y), ImVec2(x1, y + 22.f * s)))
             tooltip("Mono: same time on both sides  \xc2\xb7  L / R: own time per side  \xc2\xb7  Ping: repeats bounce between the sides");
-        y += 30.f * s;
+        y += 24.f * s;
 
         // time: synced note values, free ms, or free ms tuned to the scale (SYNC and TUNE light one at a time)
         const bool sync = pv[LVC_DLYSYNC] > 0.5f;
@@ -5461,7 +5631,7 @@ protected:
                 tooltip("Tune: the free times snap to notes of the pitchmap's key and scale (time = 1 / pitch).\n"
                         "Short times with high feedback ring at that note; set the scale in SPECTRAL PITCHMAP.");
         }
-        y += 26.f * s;
+        y += 22.f * s;
 
         const bool stereo = static_cast<int>(pv[LVC_DLYSTEREO] + 0.5f) == 1;
         const float r = 17.f * s;
@@ -5474,12 +5644,17 @@ protected:
         }
         knob(dl, il, stereo ? "LEFT" : "TIME", ImVec2(x0 + w * 0.25f, y + r), r, on, false, w * 0.5f, -1.f, tuned ? noteL : nullptr);
         knob(dl, ir, "RIGHT", ImVec2(x0 + w * 0.75f, y + r), r, on && stereo, false, w * 0.5f, -1.f, tuned ? noteR : nullptr);
-        y += r * 2.f + 40.f * s;
+        y += r * 2.f + 30.f * s;
 
-        const float r2 = 15.f * s;
-        knob(dl, LVC_FEEDBACK, "FEEDBACK", ImVec2(x0 + w / 6.f, y + r2), r2, on, false, w / 3.f);
-        knob(dl, LVC_DLYMIX, "MIX", ImVec2(x0 + w * 0.5f, y + r2), r2, on, false, w / 3.f);
-        knob(dl, LVC_DLYTONE, "TONE", ImVec2(x0 + w * 5.f / 6.f, y + r2), r2, on, false, w / 3.f);
+        // feedback and amount are per-slice random ranges, just like the comb's TIME.
+        // AMOUNT means send level in SEND mode and dry/wet in INSERT mode.
+        const bool sendRoute = pv[LVC_DLYROUTE] > 0.5f;
+        rangeSlider(dl, LVC_MINFEEDBACK, LVC_FEEDBACK, "FEEDBACK", ImVec2(x0, y), w, false, on);
+        y += 38.f * s;
+        rangeSlider(dl, LVC_MINDLYMIX, LVC_DLYMIX, sendRoute ? "SEND" : "DRY / WET", ImVec2(x0, y), w, false, on);
+        y += 38.f * s;
+        const float r2 = 13.f * s;
+        knob(dl, LVC_DLYTONE, "TONE", ImVec2((x0 + x1) * 0.5f, y + r2), r2, on, false, w);
     }
 
     void drawDelayPanel(ImDrawList* dl, ImVec2 a, ImVec2 b)
@@ -5490,13 +5665,21 @@ protected:
         const float x0 = a.x + 16.f * s, x1 = b.x - 16.f * s, w = x1 - x0;
         const bool on = pv[LVC_COMB] > 0.5f;
         const bool echo = pv[LVC_DLYMODE] > 0.5f;
+        const bool sendRoute = pv[LVC_DLYROUTE] > 0.5f;
         float y = top - 4.f * s;
         fxHeader(dl, x0, x1, y, echo ? "ON" : "PER SLICE", LVC_COMB);
         y += 30.f * s;
         // mode: the per-slice comb, or the synced stereo echo
         static const char* const modes[2] = { "COMB", "ECHO" };
-        segmented(dl, LVC_DLYMODE, modes, 2, ImVec2(x0, y), ImVec2(x1, y + 24.f * s));
-        y += 32.f * s;
+        segmented(dl, LVC_DLYMODE, modes, 2, ImVec2(x0, y), ImVec2(x1, y + 22.f * s));
+        y += 26.f * s;
+        // route: INSERT puts the delay in the slice path (AMOUNT = dry/wet); SEND adds a parallel tail
+        static const char* const routes[2] = { "INSERT", "SEND" };
+        segmented(dl, LVC_DLYROUTE, routes, 2, ImVec2(x0, y), ImVec2(x1, y + 22.f * s), on);
+        if (ImGui::IsMouseHoveringRect(ImVec2(x0, y), ImVec2(x1, y + 22.f * s)))
+            tooltip(sendRoute ? "SEND: the delay runs in parallel and its tail rings after the slice. AMOUNT sets the send level."
+                              : "INSERT: the delay replaces the slice signal. AMOUNT sets the dry / wet balance.");
+        y += 26.f * s;
         if (echo)
         {
             drawEchoControls(dl, x0, x1, y, on);
@@ -5532,9 +5715,9 @@ protected:
                 std::snprintf(buf, sizeof(buf), "%s \xe2\x80\x93 %s", lo, hi);
             textCentered(dl, fSmall, ImVec2((x0 + x1) * 0.5f, y - 8.f * s), U32(P.c, on ? 0.95f : 0.5f), buf);
         }
-        const float r = 19.f * s;
-        const float ky = std::min(y + 20.f * s + r, b.y - 14.f * s - r - 32.f * s);
-        knob(dl, LVC_FEEDBACK, "FEEDBACK", ImVec2((x0 + x1) * 0.5f, ky), r, on, false, w);
+        rangeSlider(dl, LVC_MINFEEDBACK, LVC_FEEDBACK, "FEEDBACK", ImVec2(x0, y), w, false, on);
+        y += 38.f * s;
+        rangeSlider(dl, LVC_MINDLYMIX, LVC_DLYMIX, sendRoute ? "SEND" : "DRY / WET", ImVec2(x0, y), w, false, on);
     }
 
     // ---- antialiased band: filled strip (per-vertex colour) between two contours ----

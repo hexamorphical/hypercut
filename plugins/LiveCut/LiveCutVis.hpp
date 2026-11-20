@@ -33,6 +33,9 @@ static constexpr int kBufferBins   = 4096; // capture-buffer waveform resolution
 static constexpr int kScopeColumns = 8192; // scrolling output history: 4 bars (2 shown at 1x zoom)
 static constexpr int kScopeBars    = 4;
 static constexpr int kChromaNotes  = 128;  // Chroma levels, one per MIDI note
+// Current per-slice value of each parameter, indexed by the parameter ID. Kept generously above
+// LVC_CONTROL_NR so adding controls never reshapes the shared state (checked by a static_assert).
+static constexpr int kMaxParams    = 160;
 
 enum ScopeFlags : uint8_t {
     kFlagCutStart   = 0x01,
@@ -109,7 +112,12 @@ struct State {
     float   scopeRate[kScopeColumns] {};        // bitcrusher sample rate (Hz)
     float   scopeComb[kScopeColumns] {};        // comb delay (ms)
     float   scopeLP[kScopeColumns] {};          // per-slice lowpass cutoff (Hz), negative when the filter is off
+    float   scopeHP[kScopeColumns] {};          // per-slice highpass cutoff (Hz), for the panel's response curve
     float   scopeVerb[kScopeColumns] {};        // reverb send level (0..1)
+
+    // ---- currently selected value for every min/max slider, indexed by its lower parameter ID ----
+    float   paramCurrent[kMaxParams] {};
+    uint8_t paramCurrentValid[kMaxParams] {};
 
     // ---- levels / transport ----
     std::atomic<float> levelIn  { 0.f };

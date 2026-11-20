@@ -1,9 +1,9 @@
-# Builds HyperCut for Windows and macOS. Linux release builds are made locally with scripts/build-linux-release.sh
-# and uploaded to the release by hand.
+# Builds HyperCut for Windows, Linux and macOS. Every job uploads a zip with all plugin formats
+# plus the native installers for its platform (EXE / DEB+AppImage / PKG+DMG).
 #
-# - Every push to master and every pull request: build both, keep the zips as workflow artifacts.
-# - Pushing a tag like v0.2-beta: also publish the zips to that release (created and marked Latest if missing).
-# - Run it by hand (Actions > build > Run workflow) with a release tag to (re)upload the zips to an existing release.
+# - Every push to master and every pull request: build all three, keep the files as workflow artifacts.
+# - Pushing a tag like v0.2-beta: also publish everything to that release (created and marked Latest if missing).
+# - Run it by hand (Actions > build > Run workflow) with a release tag to (re)upload to an existing release.
 
 name: build
 
@@ -50,12 +50,68 @@ jobs:
           submodules: recursive
       - name: Build
         run: make -f Makefile-windows -j"$(nproc)"
-      - name: Package
+      - name: Package zip
         run: bash scripts/package.sh "${VERSION:0:24}" windows-x64
+      - name: Installer version
+        shell: pwsh
+        run: |
+          $v = $env:VERSION -replace '^v', ''
+          if ($v -match '^dev-') { $v = '0.0.0' }
+          $m = [regex]::Match($v, '^\d+(\.\d+){0,2}')
+          $pkg = if ($m.Success) { $m.Value } else { '0.0.0' }
+          "PKG_VERSION=$pkg" >> $env:GITHUB_ENV
+      - name: Install Inno Setup
+        # newer windows-latest images no longer ship it; skip if an older image already has it
+        shell: pwsh
+        run: |
+          $found = @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe',
+                     'C:\Program Files (x86)\Inno Setup 7\ISCC.exe', 'C:\Program Files\Inno Setup 7\ISCC.exe') |
+                   Where-Object { Test-Path $_ }
+          if (-not $found) { choco install innosetup -y --no-progress }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build EXE installer
+        shell: pwsh
+        run: |
+          $iscc = @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe',
+                    'C:\Program Files (x86)\Inno Setup 7\ISCC.exe', 'C:\Program Files\Inno Setup 7\ISCC.exe') |
+                  Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw 'Inno Setup was not found on this runner' }
+          & $iscc "/DPkgVersion=$env:PKG_VERSION" 'packaging\hypercut.iss'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
           name: hypercut-windows-x64
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.exe
+
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git pkg-config freeglut3-dev \
+            libgl1-mesa-dev libx11-dev libxext-dev libxcursor-dev libxrandr-dev libdbus-1-dev
+      - name: Build (glibc 2.35 baseline) and package zip
+        run: bash scripts/build-linux-release.sh "${VERSION:0:24}"
+      - name: Installer version
+        run: echo "PKG_VERSION=$(bash scripts/pkg-version.sh "$VERSION")" >> "$GITHUB_ENV"
+      - name: Build DEB installer
+        run: bash scripts/package-deb.sh "${VERSION:0:24}"
+      - name: Build AppImage
+        run: bash scripts/package-appimage.sh "${VERSION:0:24}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hypercut-linux-x86_64
+          path: |
+            dist/*.zip
+            dist/*.deb
+            dist/*.AppImage
 
   macos:
     name: macOS universal
@@ -74,16 +130,23 @@ jobs:
             codesign --force --deep --sign - "$b"
           done
           codesign --force --sign - bin/HyperCut.lv2/HyperCut.dylib
-      - name: Package
+      - name: Package zip
         run: bash scripts/package.sh "${VERSION:0:24}" macos-universal
+      - name: Installer version
+        run: echo "PKG_VERSION=$(bash scripts/pkg-version.sh "$VERSION")" >> "$GITHUB_ENV"
+      - name: Build PKG and DMG installers
+        run: bash scripts/package-macos.sh "${VERSION:0:24}"
       - uses: actions/upload-artifact@v4
         with:
           name: hypercut-macos-universal
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.pkg
+            dist/*.dmg
 
   release:
     name: Publish to the release
-    needs: [windows, macos]
+    needs: [windows, linux, macos]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
@@ -100,11 +163,14 @@ jobs:
         run: |
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
-              --title "HyperCut $TAG" --notes "Builds for Windows and macOS (Linux builds are added separately). See the README for installing."
+              --title "HyperCut $TAG" \
+              --notes "Installers: Windows .exe, Linux .deb + .AppImage, macOS .pkg + .dmg. Each release also includes a .zip with every plugin format. See the README for installing."
           fi
-          gh release upload "$TAG" dist/*.zip --repo "$GITHUB_REPOSITORY" --clobber
-          # checksums of every zip on the release, the Linux ones uploaded by hand included
+          gh release upload "$TAG" \
+            dist/*.zip dist/*.exe dist/*.deb dist/*.AppImage dist/*.pkg dist/*.dmg \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          # checksums of every asset on the release
           mkdir -p all
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --dir all --clobber
-          (cd all && sha256sum ./*.zip > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir all --clobber
+          (cd all && find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt && cat SHA256SUMS.txt)
           gh release upload "$TAG" all/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber

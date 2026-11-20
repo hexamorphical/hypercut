@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.2
+
+- **Delay INSERT / SEND routing.** A new switch in the DELAY panel: INSERT keeps the delay in the slice path and the
+  AMOUNT slider is the dry/wet balance; SEND runs a parallel tail that rings over the dry signal and AMOUNT becomes the
+  send level. The default is INSERT, so existing sessions are unchanged.
+- **Random delay ranges.** TIME, FEEDBACK and AMOUNT each use a min/max range with a live marker showing the value of
+  the current slice. Older presets are migrated automatically.
+- **Filter and crush visualisations.** The FILTER panel shows the live frequency response and the CRUSH panel shows
+  the waveform and bit-depth grid, driven by the real DSP state.
+- **Native installers.** Releases now include a Windows `.exe`, Linux `.deb` and `.AppImage`, and macOS `.pkg` and
+  `.dmg`, alongside the zip with every plugin format. Linux builds moved into GitHub Actions too.
+
 ## v0.2.1
 
 - **Ableton Live parameter clicks fixed.** One-shot edits such as the algorithm selector now go straight through

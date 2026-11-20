@@ -63,7 +63,7 @@ The full git history of Livecut and the DPF port is kept in this repository.
 
 ## Download and install
 
-Download the zip for your system with the buttons at the top, or from the
+Download a build with the buttons at the top, or from the
 [Releases page](https://github.com/hexamorphical/hypercut/releases). Each zip has every format; copy the one your DAW
 uses into its plugin folder:
 
@@ -74,6 +74,19 @@ uses into its plugin folder:
 | LV2 (`HyperCut.lv2`) | `~/.lv2/` | `C:\Program Files\Common Files\LV2\` | `~/Library/Audio/Plug-Ins/LV2/` |
 | VST2 | `HyperCut-vst.so` in `~/.vst/` | `HyperCut-vst.dll` in your DAW's VST folder | `HyperCut.vst` in `~/Library/Audio/Plug-Ins/VST/` |
 | Standalone | `HyperCut` (JACK; on PipeWire run `pw-jack ./HyperCut`) | `HyperCut.exe` | `HyperCut.app` |
+
+If you prefer a system-wide install, each release also has native installers:
+
+| Platform | File | What it installs |
+| --- | --- | --- |
+| Windows | `.exe` (Inno Setup) | VST3, CLAP, LV2 and VST2 into Common Files; standalone into Program Files |
+| Linux | `.deb` | Same four plugins into `/usr/lib/`, standalone into `/usr/bin` |
+| Linux | `.AppImage` | Portable standalone only; plugins still come from the zip or `.deb` |
+| macOS | `.pkg` | VST3, CLAP, LV2 and VST2 into `/Library/Audio/Plug-Ins/`, standalone into `/Applications` |
+| macOS | `.dmg` | Drag the standalone `HyperCut.app` to Applications |
+
+The Windows, Linux and macOS builds and installers are produced by GitHub Actions (`.github/workflows/build.yml`).
+None are code-signed or notarized, so your OS may warn on first run; on macOS, clear the quarantine as described below.
 
 Then rescan plugins in your DAW. HyperCut is an effect: put it on an audio track (drums and loops are the classic
 source) and press play. It follows the host's tempo and time signature.
@@ -88,8 +101,8 @@ source) and press play. It follows the host's tempo and time signature.
   xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/HyperCut.vst3
   ```
 
-> The Windows and macOS builds are made automatically by GitHub Actions and have not been tested on real hardware yet.
-> Reports in [Issues](https://github.com/hexamorphical/hypercut/issues) are very welcome.
+> The Windows, Linux and macOS builds are made automatically by GitHub Actions and have not been tested on real
+> hardware yet. Reports in [Issues](https://github.com/hexamorphical/hypercut/issues) are very welcome.
 
 ## Features
 
@@ -255,6 +268,14 @@ cd hypercut
 make -f Makefile-windows
 ```
 
+After building, copy the VST3 bundle to the system VST3 folder:
+
+```powershell
+Copy-Item -Recurse -Force bin\HyperCut.vst3 "C:\Program Files\Common Files\VST3\HyperCut.vst3"
+```
+
+Close any DAW that has HyperCut loaded first: Windows locks the `.vst3` DLL while a host is using it, so the copy will fail until the host is closed.
+
 ### macOS (untested)
 
 ```sh
@@ -263,6 +284,22 @@ git clone --recursive https://github.com/hexamorphical/hypercut.git
 cd hypercut
 make
 ```
+
+### Building the installers
+
+After a successful build, the native installers can be produced on their own platform (the same commands the GitHub
+Actions workflow uses, with `<tag>` replaced by the release tag):
+
+```sh
+# Windows (MSYS2 shell for the build, PowerShell for Inno Setup 6):
+#   & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' "/DPkgVersion=<version>" 'packaging\hypercut.iss'
+bash scripts/package-deb.sh <tag>          # Linux, needs dpkg-deb
+bash scripts/package-appimage.sh <tag>     # Linux, downloads appimagetool
+bash scripts/package-macos.sh <tag>        # macOS, uses pkgbuild / productbuild / hdiutil
+```
+
+Output goes into `dist/`. `scripts/pkg-version.sh` reduces a tag such as `v0.2.2-delay-route` to the numeric version
+`0.2.2` used by the installers.
 
 ## License
 
