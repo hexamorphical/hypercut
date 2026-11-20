@@ -19,6 +19,8 @@ mkdir -p "$appdir/usr/bin" \
 cp bin/HyperCut "$appdir/usr/bin/HyperCut"
 # AppImages resolve their desktop entry via AppRun, while the .deb entry launches the binary directly.
 sed 's/^Exec=.*/Exec=AppRun/' packaging/hypercut.desktop > "$appdir/usr/share/applications/hypercut.desktop"
+# This appimagetool build looks for the desktop entry at the AppDir root.
+cp "$appdir/usr/share/applications/hypercut.desktop" "$appdir/hypercut.desktop"
 cp packaging/hypercut.png "$appdir/usr/share/icons/hicolor/256x256/apps/hypercut.png"
 cp packaging/hypercut.png "$appdir/hypercut.png"
 ln -s hypercut.png "$appdir/.DirIcon"
