@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Packages the build in bin/ into dist/HyperCut-<platform>.zip with every format, inside a folder that names the version.
-# The zip name has no version, so https://github.com/hexamorphical/hypercut/releases/latest/download/HyperCut-<platform>.zip
-# always points at the newest release.
+# Packages the build in bin/ into dist/HyperCut-<version>-<platform>.zip with every format, inside a folder that names the version.
+# The zip name includes the version, so downloads are easy to identify after saving them.
 # Works for the Linux, Windows (MSYS2) and macOS builds; the file names differ per platform.
 # Usage: scripts/package.sh <version> <platform>     e.g. scripts/package.sh v0.1-beta windows-x64
 set -euo pipefail
@@ -9,7 +8,7 @@ cd "$(dirname "$0")/.."
 VERSION="${1:?usage: $0 <version> <platform>}"
 PLATFORM="${2:?usage: $0 <version> <platform>}"
 base="HyperCut-$VERSION-$PLATFORM"   # folder inside the zip
-zipname="HyperCut-$PLATFORM.zip"
+zipname="HyperCut-$VERSION-$PLATFORM.zip"
 
 # zip, or bsdtar where zip is not installed
 mkzip() { local dst="$1"; shift; if command -v zip >/dev/null; then zip -qry "$dst" "$@"; else bsdtar --format zip -cf "$dst" "$@"; fi; }

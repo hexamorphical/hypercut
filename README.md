@@ -17,8 +17,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/hexamorphical/hypercut/releases/latest/download/HyperCut-windows-x64.zip"><img alt="Download for Windows" src="https://img.shields.io/badge/Download-Windows-2f81f7?style=for-the-badge"></a>
-  <a href="https://github.com/hexamorphical/hypercut/releases/latest/download/HyperCut-macos-universal.zip"><img alt="Download for macOS" src="https://img.shields.io/badge/Download-macOS-8250df?style=for-the-badge"></a>
+  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.2.1/HyperCut-0.2.1-windows-x64.zip"><img alt="Download for Windows" src="https://img.shields.io/badge/Download-Windows-2f81f7?style=for-the-badge"></a>
+  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.2.1/HyperCut-0.2.1-macos-universal.zip"><img alt="Download for macOS" src="https://img.shields.io/badge/Download-macOS-8250df?style=for-the-badge"></a>
   <a href="https://github.com/hexamorphical/hypercut/releases/latest/download/HyperCut-linux-x86_64.zip"><img alt="Download for Linux" src="https://img.shields.io/badge/Download-Linux-e8a33d?style=for-the-badge"></a>
 </p>
 
