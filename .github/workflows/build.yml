@@ -50,9 +50,7 @@ jobs:
           submodules: recursive
       - name: Build
         run: make -f Makefile-windows -j"$(nproc)"
-      - name: Package zip
-        run: bash scripts/package.sh "${VERSION:0:24}" windows-x64
-      - name: Installer version
+      - name: Package version
         shell: pwsh
         run: |
           $v = $env:VERSION -replace '^v', ''
@@ -60,6 +58,8 @@ jobs:
           $m = [regex]::Match($v, '^\d+(\.\d+){0,2}')
           $pkg = if ($m.Success) { $m.Value } else { '0.0.0' }
           "PKG_VERSION=$pkg" >> $env:GITHUB_ENV
+      - name: Package zip
+        run: bash scripts/package.sh "$PKG_VERSION" windows-x64
       - name: Install Inno Setup
         # newer windows-latest images no longer ship it; skip if an older image already has it
         shell: pwsh
@@ -97,14 +97,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential git pkg-config freeglut3-dev \
             libgl1-mesa-dev libx11-dev libxext-dev libxcursor-dev libxrandr-dev libdbus-1-dev
-      - name: Build (glibc 2.35 baseline) and package zip
-        run: bash scripts/build-linux-release.sh "${VERSION:0:24}"
-      - name: Installer version
+      - name: Package version
         run: echo "PKG_VERSION=$(bash scripts/pkg-version.sh "$VERSION")" >> "$GITHUB_ENV"
+      - name: Build (glibc 2.35 baseline) and package zip
+        run: bash scripts/build-linux-release.sh "$PKG_VERSION"
       - name: Build DEB installer
-        run: bash scripts/package-deb.sh "${VERSION:0:24}"
+        run: bash scripts/package-deb.sh "$PKG_VERSION"
       - name: Build AppImage
-        run: bash scripts/package-appimage.sh "${VERSION:0:24}"
+        run: bash scripts/package-appimage.sh "$PKG_VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: hypercut-linux-x86_64
@@ -120,6 +120,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Package version
+        run: echo "PKG_VERSION=$(bash scripts/pkg-version.sh "$VERSION")" >> "$GITHUB_ENV"
       - name: Build (Intel + Apple Silicon, macOS 10.15+)
         run: make macos-universal-10.15 -j"$(sysctl -n hw.ncpu)"
       - name: Ad-hoc sign
@@ -131,11 +133,9 @@ jobs:
           done
           codesign --force --sign - bin/HyperCut.lv2/HyperCut.dylib
       - name: Package zip
-        run: bash scripts/package.sh "${VERSION:0:24}" macos-universal
-      - name: Installer version
-        run: echo "PKG_VERSION=$(bash scripts/pkg-version.sh "$VERSION")" >> "$GITHUB_ENV"
+        run: bash scripts/package.sh "$PKG_VERSION" macos-universal
       - name: Build PKG and DMG installers
-        run: bash scripts/package-macos.sh "${VERSION:0:24}"
+        run: bash scripts/package-macos.sh "$PKG_VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: hypercut-macos-universal

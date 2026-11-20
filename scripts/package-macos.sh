@@ -28,7 +28,9 @@ mkdir -p "$stage"
 # component <stage name> <source in bin/> <install location> <identifier>
 component() {
     local name="$1" src="$2" loc="$3" id="$4"
-    cp -R "$src" "$stage/$name"
+    # Keep the bundle itself inside the pkg root, not just its Contents folder.
+    mkdir -p "$stage/$name"
+    cp -R "$src" "$stage/$name/"
     pkgbuild --root "$stage/$name" --install-location "$loc" \
              --identifier "$id" --version "$PKG_VERSION" "$root/$name.pkg"
 }
@@ -54,7 +56,9 @@ for p in "${pkgs[@]}"; do args+=(--package "$p"); done
 mkdir -p dist
 outpkg="dist/HyperCut-$VERSION-macos-universal.pkg"
 rm -f "$outpkg"
-productbuild "${args[@]}" --title "HyperCut $VERSION" "$outpkg"
+# productbuild accepts --title only with --distribution; the synthesized
+# distribution from --package is enough for these system-wide components.
+productbuild "${args[@]}" "$outpkg"
 ls -l "$outpkg"
 
 # The dmg is a drag-to-Applications standalone, with a short install note.

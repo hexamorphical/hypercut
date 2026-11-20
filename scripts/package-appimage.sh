@@ -4,7 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VERSION="${1:?usage: $0 <version>}"
-TOOL_VERSION="${APPIMAGETOOL_VERSION:-v13}"
+# AppImageKit removed the old v13 release; "continuous" is the maintained tool build.
+TOOL_VERSION="${APPIMAGETOOL_VERSION:-continuous}"
 
 [ -f bin/HyperCut ] || { echo "error: build the standalone first (make)" >&2; exit 1; }
 
