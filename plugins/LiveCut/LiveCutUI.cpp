@@ -855,7 +855,7 @@ class HyperCutUI : public UI
 
 public:
     HyperCutUI()
-        : UI(DISTRHO_UI_DEFAULT_WIDTH, DISTRHO_UI_DEFAULT_HEIGHT, true)
+        : UI(DISTRHO_UI_DEFAULT_WIDTH, DISTRHO_UI_DEFAULT_HEIGHT, false)
     {
         hostScale = getScaleFactor();
 
@@ -1720,10 +1720,10 @@ protected:
     // ----------------------------------------------------------------------------------------------------------------
     // Fonts
 
-    // layout scale from the area left for the controls (the sidebar's width is not part of it)
-    float computeScale(float sideVisible = 0.f) const
+    // layout scale from the current window size (preset browser is a dropdown popup now)
+    float computeScale(float /*sideVisible*/ = 0.f) const
     {
-        const float w = static_cast<float>(getWidth()) - sideVisible;
+        const float w = static_cast<float>(getWidth());
         const float h = static_cast<float>(getHeight());
         return std::max(0.5f, std::min(4.f, std::min(w / kBaseW, h / kBaseH)));
     }
@@ -2867,20 +2867,21 @@ protected:
         if (arrow("##prevpreset", true) && n > 0)
             loadPreset(currentPreset < 0 ? 0 : (currentPreset + n - 1) % n);
 
-        // name box (opens the browser)
+        // name box (opens the preset browser dropdown)
         {
             const ImVec2 na(x, a.y), nb(x + nameW, a.y + h);
             ImGui::SetCursorScreenPos(na);
+            const bool popupOpen = ImGui::IsPopupOpen("##presetbrowser");
             if (ImGui::InvisibleButton("##presetname", nb - na))
-                setSidebar(! sideOpen);
+                ImGui::OpenPopup("##presetbrowser");
             const bool hov = ImGui::IsItemHovered();
             if (hov)
             {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                tooltip(sideOpen ? "Close the preset browser" : "Browse presets");
+                tooltip(popupOpen ? "Close the preset browser" : "Browse presets");
             }
             inset(dl, na, nb, 9.f * s);
-            if (hov)
+            if (hov || popupOpen)
                 dl->AddRect(na, nb, U32(P.a, 0.5f), 9.f * s, 0, 1.f);
             std::string label = currentName;
             const bool modified = presetModified();
@@ -2894,15 +2895,50 @@ protected:
             if (modified)
                 label += " *";
             text(dl, fBold, ImVec2(na.x + 28.f * s, cy - fs(fBold) * 0.5f - 1.f * s), U32(P.text), label.c_str());
-            // chevron: points right (opens the sidebar), turns to point left while it is out
+            // chevron (dropdown)
             {
                 const ImVec2 cc(nb.x - 12.f * s, cy);
-                const float ang = sideEase() * IM_PI;
+                const float ang = popupOpen ? IM_PI : 0.f;
                 const float ca = std::cos(ang), sa = std::sin(ang);
                 auto R = [&](float px, float py) { return ImVec2(cc.x + px * ca - py * sa, cc.y + px * sa + py * ca); };
-                dl->AddTriangleFilled(R(3.f * s, 0.f), R(-2.f * s, -4.f * s), R(-2.f * s, 4.f * s),
-                                      U32(sideOpen ? P.b : P.textDim));
+                dl->AddTriangleFilled(R(0.f, 3.f * s), R(-4.f * s, -2.f * s), R(4.f * s, -2.f * s),
+                                      U32(popupOpen ? P.b : P.textDim));
             }
+
+            if (ImGui::BeginPopup("##presetbrowser"))
+            {
+                ImGui::SetNextItemWidth(300.f * s);
+                ImGui::InputTextWithHint("##presetsearch", tr("Search presets"), presetSearch, sizeof(presetSearch));
+                ImGui::Separator();
+                if (ImGui::BeginChild("##presetlist", ImVec2(420.f * s, 320.f * s), false))
+                {
+                    const std::string query = lowerCase(presetSearch);
+                    bool any = false;
+                    for (int i = 0; i < static_cast<int>(presets.size()); ++i)
+                    {
+                        const PresetEntry& pe = presets[static_cast<size_t>(i)];
+                        if (! query.empty() && ! presetMatches(pe, query))
+                            continue;
+                        any = true;
+                        const bool selected = (i == currentPreset);
+                        std::string row = pe.name;
+                        if (! pe.author.empty()) row += "  —  " + pe.author;
+                        if (! pe.category.empty()) row += "  [" + pe.category + "]";
+                        if (ImGui::Selectable(row.c_str(), selected))
+                        {
+                            loadPreset(i);
+                            ImGui::CloseCurrentPopup();
+                        }
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    if (! any)
+                        ImGui::TextDisabled("%s", tr("No presets found"));
+                }
+                ImGui::EndChild();
+                ImGui::EndPopup();
+            }
+
             x += nameW + gap;
         }
 
@@ -2965,62 +3001,23 @@ protected:
 
     void setSidebar(bool open)
     {
-        if (open == sideOpen)
-            return;
-        if (open && sideAnim <= 0.f)
-        {
-            sideBaseW = getWidth();
-            sidePx = std::round(kSideW * s);
-        }
-        else if (! open)
-        {
-            // the window may have been resized while the sidebar was out: close back to what is left of it
-            const uint w = getWidth();
-            if (sideAnim >= 1.f && w >= sideBaseW + static_cast<uint>(sidePx * 0.5f))
-                sideBaseW = std::max(static_cast<uint>(kMinW * hostScale), w - static_cast<uint>(sidePx));
-        }
         sideOpen = open;
-        repaint();
+        sideAnim = 0.f;
+        (void)open;
     }
 
-    // advances the slide and asks the host for the matching window width. Returns the sidebar's visible width:
-    // if the host does not resize, the layout simply gets narrower by that much.
+    // preset browser is now a dropdown popup; window resizing/sidebar animation disabled
     float updateSidebar()
     {
-        const float target = sideOpen ? 1.f : 0.f;
-        if (sideAnim != target)
-        {
-            const float dt = std::max(0.f, std::min(0.05f, ImGui::GetIO().DeltaTime));
-            const float step = dt / 0.22f; // ~220 ms
-            sideAnim = sideOpen ? std::min(1.f, sideAnim + step) : std::max(0.f, sideAnim - step);
-            const uint want = sideBaseW + static_cast<uint>(std::lround(sidePx * sideEase()));
-            if (want != getWidth())
-                setSize(want, getHeight());
-            repaint();
-        }
-        if (sideAnim <= 0.f)
-        {
-            sideNoResize = 0;
-            return 0.f;
-        }
-        // lay out with the width the window really has (the host applies a resize a frame later), so the controls
-        // keep their size while it slides; a host that does not resize at all gets a narrower layout instead
-        const uint w = getWidth();
-        if (w > sideBaseW)
-        {
-            sideNoResize = 0;
-            return std::min(static_cast<float>(w - sideBaseW), sidePx);
-        }
-        return ++sideNoResize > 4 ? sidePx * sideEase() : 0.f;
+        sideAnim = 0.f;
+        sideNoResize = 0;
+        return 0.f;
     }
 
     // width the window would have without the sidebar (what the size preference stores)
     uint widthWithoutSidebar() const
     {
-        const uint w = getWidth();
-        if (sideAnim <= 0.f || w <= sideBaseW)
-            return w;
-        return w - std::min(w - sideBaseW, static_cast<uint>(sidePx));
+        return getWidth();
     }
 
     static std::string lowerCase(std::string v)
@@ -3082,333 +3079,7 @@ protected:
         dl->AddLine(ImVec2(c.x, c.y - r * 0.2f), ImVec2(c.x, c.y + r * 0.7f), col, th);
     }
 
-    void drawPresetSidebar(ImDrawList* dl, float x0, float W, float H)
-    {
-        const float pad = 16.f * s;
-        if (W - x0 < 1.f)
-            return;
-        const float t = sideEase();
-        // the panel is laid out at its full width and revealed from the left edge as it slides out
-        const ImVec2 a(x0, pad), b(x0 + sidePx - pad, H - pad);
-        dl->PushClipRect(ImVec2(x0, 0.f), ImVec2(W, H), true);
-        const int v0 = dl->VtxBuffer.Size;
-        const float top = panel(dl, a, b, "PRESETS");
-
-        // close button
-        {
-            const float bs = 22.f * s;
-            const ImVec2 ca(b.x - 12.f * s - bs, a.y + 10.f * s), cb(ca.x + bs, ca.y + bs);
-            ImGui::SetCursorScreenPos(ca);
-            if (ImGui::InvisibleButton("##sideclose", cb - ca))
-                setSidebar(false);
-            const bool hov = ImGui::IsItemHovered();
-            if (hov)
-            {
-                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                tooltip("Close");
-            }
-            iconButtonFrame(dl, ca, cb, hov);
-            dl_x(dl, (ca + cb) * 0.5f, 4.f * s, U32(hov ? P.text : P.textDim));
-        }
-
-        const float x = a.x + 14.f * s, xr = b.x - 14.f * s;
-        float y = top - 6.f * s;
-
-        // ---- favourites filter + search ----
-        float sx = x;
-        {
-            const float sh = 28.f * s;
-            const ImVec2 fa(x, y), fb(x + sh, y + sh);
-            ImGui::SetCursorScreenPos(fa);
-            if (ImGui::InvisibleButton("##favonly", fb - fa))
-                favOnly = ! favOnly;
-            const bool hv = ImGui::IsItemHovered();
-            if (hv)
-            {
-                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                tooltip(favOnly ? "Showing favourites only: click to show all presets" : "Show favourites only");
-            }
-            if (favOnly)
-                dl->AddRectFilled(fa, fb, U32(P.c, 0.22f), sh * 0.5f);
-            iconButtonFrame(dl, fa, fb, hv);
-            drawStar(dl, (fa + fb) * 0.5f, 7.f * s, U32(favOnly ? P.c : (hv ? P.text : P.textDim)), favOnly);
-            sx = fb.x + 6.f * s;
-        }
-        {
-            const float sh = 28.f * s;
-            const float x = sx; // the search field starts after the favourites button
-            ImGui::SetCursorScreenPos(ImVec2(x, y));
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(28.f * s, (sh - fs(fBody)) * 0.5f));
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, sh * 0.5f);
-            ImGui::PushItemWidth(xr - x);
-            ImGui::InputTextWithHint("##presetsearch", tr("Search name, author, category"), presetSearch, sizeof(presetSearch));
-            ImGui::PopItemWidth();
-            ImGui::PopStyleVar(2);
-            // magnifier
-            const ImVec2 mc(x + 14.f * s, y + sh * 0.5f - 1.f * s);
-            dl->AddCircle(mc, 5.f * s, U32(P.textDim), 16, 1.5f * s);
-            dl->AddLine(ImVec2(mc.x + 3.6f * s, mc.y + 3.6f * s), ImVec2(mc.x + 7.f * s, mc.y + 7.f * s), U32(P.textDim), 1.6f * s);
-            if (presetSearch[0] != '\0')
-            {
-                const ImVec2 cc(xr - 14.f * s, y + sh * 0.5f);
-                ImGui::SetCursorScreenPos(ImVec2(cc.x - 10.f * s, cc.y - 10.f * s));
-                if (ImGui::InvisibleButton("##clearsearch", ImVec2(20.f * s, 20.f * s)))
-                    presetSearch[0] = '\0';
-                dl_x(dl, cc, 3.5f * s, U32(ImGui::IsItemHovered() ? P.text : P.textDim));
-            }
-            y += sh + 10.f * s;
-        }
-
-        // ---- the visible rows: filtered, then sorted ----
-        const std::string query = lowerCase(presetSearch);
-        std::vector<int> rows;
-        for (int i = 0; i < static_cast<int>(presets.size()); ++i)
-        {
-            const PresetEntry& pe = presets[static_cast<size_t>(i)];
-            if ((! favOnly || isFavourite(pe)) && (query.empty() || presetMatches(pe, query)))
-                rows.push_back(i);
-        }
-        if (presetSortCol >= 0)
-        {
-            const int col = presetSortCol;
-            const bool desc = presetSortDesc;
-            std::stable_sort(rows.begin(), rows.end(), [&](int ia, int ib) {
-                const PresetEntry& pa = presets[static_cast<size_t>(ia)];
-                const PresetEntry& pb = presets[static_cast<size_t>(ib)];
-                const std::string& fa = col == 0 ? pa.name : (col == 1 ? pa.author : pa.category);
-                const std::string& fb = col == 0 ? pb.name : (col == 1 ? pb.author : pb.category);
-                // empty cells always go last
-                if (fa.empty() != fb.empty()) return fb.empty();
-                const std::string la = lowerCase(fa), lb = lowerCase(fb);
-                if (la == lb) return lowerCase(pa.name) < lowerCase(pb.name);
-                return desc ? la > lb : la < lb;
-            });
-        }
-
-        // ---- column headers (click to sort: ascending, descending, back to the default order) ----
-        const float colW = xr - x;
-        const float cx[3] = { x, x + colW * 0.50f, x + colW * 0.75f };
-        const float cw[3] = { colW * 0.50f, colW * 0.25f, colW * 0.25f };
-        {
-            static const char* const heads[3] = { "NAME", "AUTHOR", "CATEGORY" };
-            const float hh = 20.f * s;
-            for (int c = 0; c < 3; ++c)
-            {
-                const ImVec2 ha(cx[c], y), hb(cx[c] + cw[c] - 4.f * s, y + hh);
-                ImGui::SetCursorScreenPos(ha);
-                ImGui::PushID(c + 400);
-                if (ImGui::InvisibleButton("##head", hb - ha))
-                {
-                    if (presetSortCol != c) { presetSortCol = c; presetSortDesc = false; }
-                    else if (! presetSortDesc) presetSortDesc = true;
-                    else presetSortCol = -1;
-                }
-                const bool hv = ImGui::IsItemHovered();
-                ImGui::PopID();
-                if (hv)
-                {
-                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                    dl->AddRectFilled(ha, hb, U32(P.text, 0.05f), 5.f * s);
-                    tooltip("Sort by %s", tr(c == 0 ? "name" : (c == 1 ? "author" : "category")));
-                }
-                const bool sorted = presetSortCol == c;
-                const float tx = ha.x + (c == 0 ? 56.f * s : 4.f * s);
-                text(dl, fSmall, ImVec2(tx, ha.y + (hh - fs(fSmall)) * 0.5f - 0.5f * s),
-                     U32(sorted ? P.text : (hv ? P.textDim : P.textFaint)), heads[c]);
-                if (sorted)
-                {
-                    const float ax = tx + textSize(fSmall, heads[c]).x + 8.f * s, ay = ha.y + hh * 0.5f;
-                    const float d = presetSortDesc ? 1.f : -1.f; // up = ascending
-                    dl->AddTriangleFilled(ImVec2(ax - 3.5f * s, ay - d * 2.f * s), ImVec2(ax + 3.5f * s, ay - d * 2.f * s),
-                                          ImVec2(ax, ay + d * 2.5f * s), U32(P.b));
-                }
-            }
-            y += hh + 2.f * s;
-            dl->AddLine(ImVec2(x, y), ImVec2(xr, y), U32(P.panelBorder), 1.f);
-            y += 4.f * s;
-        }
-
-        // ---- the list (scrolls); the selected preset's details sit at the bottom ----
-        const float infoH = 74.f * s;
-        const float listH = b.y - 12.f * s - infoH - 10.f * s - y;
-        ImGui::SetCursorScreenPos(ImVec2(x - 4.f * s, y));
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
-        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 6.f * s);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
-        if (ImGui::BeginChild("##presetside", ImVec2(xr - x + 8.f * s, std::max(40.f * s, listH)), false))
-        {
-            ImDrawList* pdl = ImGui::GetWindowDrawList();
-            const float rh = 30.f * s;
-            const float w = xr - x;
-            int deleteIndex = -1;
-            bool shownUserHeader = false;
-            for (size_t r = 0; r < rows.size(); ++r)
-            {
-                const int i = rows[r];
-                const PresetEntry& pe = presets[static_cast<size_t>(i)];
-                const bool isUser = ! pe.path.empty();
-                // default order: factory first, then a thin divider before the user presets
-                if (presetSortCol < 0 && query.empty() && isUser && ! shownUserHeader)
-                {
-                    shownUserHeader = true;
-                    const ImVec2 hp = ImGui::GetCursorScreenPos();
-                    pdl->AddLine(ImVec2(hp.x + 4.f * s, hp.y + 6.f * s), ImVec2(hp.x + w, hp.y + 6.f * s), U32(P.panelBorder), 1.f);
-                    ImGui::Dummy(ImVec2(w, 12.f * s));
-                }
-                const ImVec2 ra = ImGui::GetCursorScreenPos();
-                const ImVec2 rb(ra.x + w, ra.y + rh - 2.f * s);
-                ImGui::PushID(i);
-                const bool armed = deleteArmed == i;
-                // delete (two clicks: the first arms it)
-                const float delW = armed ? 64.f * s : 24.f * s;
-                ImGui::SetCursorScreenPos(ImVec2(rb.x - delW, ra.y));
-                if (ImGui::InvisibleButton("##del", ImVec2(delW, rh - 2.f * s)))
-                {
-                    if (armed) { deleteIndex = i; deleteArmed = -1; }
-                    else deleteArmed = i;
-                }
-                const bool delHov = ImGui::IsItemHovered();
-                if (delHov)
-                    tooltip(armed ? "Click again to delete" : (isUser ? "Delete preset (asks to confirm)"
-                                                                       : "Delete: factory presets are hidden (restore them at the bottom of the list)"));
-                // favourite
-                ImGui::SetCursorScreenPos(ImVec2(ra.x, ra.y));
-                const bool favClicked = ImGui::InvisibleButton("##fav", ImVec2(24.f * s, rh - 2.f * s));
-                const bool favHov = ImGui::IsItemHovered();
-                if (favClicked) toggleFavourite(pe);
-                if (favHov) tooltip(isFavourite(pe) ? "Remove from favourites" : "Add to favourites");
-                ImGui::SetCursorScreenPos(ImVec2(ra.x + 24.f * s, ra.y));
-                const bool clicked = ImGui::InvisibleButton("##row", ImVec2(w - 24.f * s - delW, rh - 2.f * s));
-                const bool hov = ImGui::IsItemHovered() || delHov || favHov;
-                ImGui::PopID();
-                if (clicked)
-                {
-                    loadPreset(i); // the sidebar stays open: keep auditioning
-                    deleteArmed = -1;
-                }
-                if (hov)
-                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                if (armed && ! hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-                    deleteArmed = -1; // clicking anywhere else cancels
-
-                if (i == currentPreset)
-                    pdl->AddRectFilled(ra, rb, U32(P.a, 0.16f), 7.f * s);
-                else if (hov)
-                    pdl->AddRectFilled(ra, rb, U32(P.text, 0.06f), 7.f * s);
-
-                const float cy = (ra.y + rb.y) * 0.5f;
-                // favourite star
-                {
-                    const bool fav = isFavourite(pe);
-                    if (fav || hov)
-                        drawStar(pdl, ImVec2(ra.x + 12.f * s, cy), 6.f * s,
-                                 U32(fav ? P.c : (favHov ? P.text : P.textFaint)), fav);
-                }
-                // algorithm badge, name
-                const int pa = algoFromParams(pe.values);
-                const ImVec4 ac = algoColor(pa);
-                const ImVec2 bc(ra.x + 34.f * s, cy);
-                const float br = 9.f * s;
-                pdl->AddRectFilled(ImVec2(bc.x - br, bc.y - br), ImVec2(bc.x + br, bc.y + br), U32(ac, P.dark ? 0.16f : 0.12f), 5.f * s);
-                drawAlgoIcon(pdl, pa, bc, 5.f * s, U32(ac));
-                const ImU32 strong = U32(i == currentPreset || hov ? P.text : P.textDim);
-                const float colOff = ra.x - x; // the child window starts a little left of the headers
-                text(pdl, fBody, ImVec2(ra.x + 50.f * s, cy - fs(fBody) * 0.5f - 1.f * s), strong,
-                     fitText(fBody, pe.name, cw[0] - 56.f * s).c_str());
-                // author, category
-                const std::string au = pe.author.empty() ? std::string("-") : pe.author;
-                text(pdl, fSmall, ImVec2(cx[1] + colOff + 4.f * s, cy - fs(fSmall) * 0.5f - 0.5f * s),
-                     U32(pe.author.empty() ? P.textFaint : (pe.author == kFactoryAuthor ? P.textDim : P.grad(0.5f))),
-                     fitText(fSmall, au, cw[1] - 10.f * s).c_str());
-                if (! pe.category.empty())
-                {
-                    const std::string cat = fitText(fSmall, pe.category, cw[2] - 44.f * s);
-                    const float tw = textSize(fSmall, cat.c_str()).x;
-                    const ImVec2 ca(cx[2] + colOff + 2.f * s, cy - 9.f * s), cb(ca.x + tw + 14.f * s, cy + 9.f * s);
-                    pdl->AddRectFilled(ca, cb, U32(P.b, P.dark ? 0.14f : 0.12f), 9.f * s);
-                    text(pdl, fSmall, ImVec2(ca.x + 7.f * s, cy - fs(fSmall) * 0.5f - 0.5f * s), U32(P.text, 0.85f), cat.c_str());
-                }
-                if (armed)
-                {
-                    const ImVec2 da(rb.x - delW + 2.f * s, cy - 10.f * s), db(rb.x - 2.f * s, cy + 10.f * s);
-                    pdl->AddRectFilled(da, db, U32(P.rec, delHov ? 1.f : 0.85f), 10.f * s);
-                    textCentered(pdl, fSmall, (da + db) * 0.5f, IM_COL32_WHITE, "delete?");
-                }
-                else if (hov)
-                    drawTrash(pdl, ImVec2(rb.x - 12.f * s, cy), 5.f * s, U32(delHov ? P.rec : P.textDim));
-
-                ImGui::SetCursorScreenPos(ImVec2(ra.x, ra.y + rh));
-                ImGui::Dummy(ImVec2(0, 0));
-            }
-            if (rows.empty())
-            {
-                const ImVec2 hp = ImGui::GetCursorScreenPos();
-                text(pdl, fSmall, ImVec2(hp.x + 8.f * s, hp.y + 10.f * s), U32(P.textFaint),
-                     favOnly && query.empty() ? "No favourites yet: click the star on a preset" : "No preset matches the search");
-                ImGui::Dummy(ImVec2(w, 36.f * s));
-            }
-            // hidden (deleted) factory presets can come back
-            if (! hiddenFactory.empty())
-            {
-                char buf[64];
-                std::snprintf(buf, sizeof(buf), tr("%d hidden factory preset%s \xc2\xb7 restore"), static_cast<int>(hiddenFactory.size()),
-                              hiddenFactory.size() == 1 ? "" : "s");
-                const ImVec2 hp = ImGui::GetCursorScreenPos();
-                const ImVec2 ts = textSize(fSmall, buf);
-                const ImVec2 la(hp.x + 8.f * s, hp.y + 10.f * s);
-                ImGui::SetCursorScreenPos(la);
-                if (ImGui::InvisibleButton("##restore", ImVec2(ts.x, ts.y + 4.f * s)))
-                    restoreHiddenPresets();
-                const bool hv = ImGui::IsItemHovered();
-                if (hv) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                text(pdl, fSmall, la, U32(hv ? P.text : P.textFaint), buf);
-                ImGui::SetCursorScreenPos(ImVec2(hp.x, la.y + ts.y + 12.f * s));
-                ImGui::Dummy(ImVec2(w, 0.f));
-            }
-            if (deleteIndex >= 0)
-                deletePreset(deleteIndex);
-        }
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
-        ImGui::PopStyleVar(2);
-
-        // ---- the selected preset, at the bottom ----
-        {
-            const ImVec2 ca(x, b.y - 12.f * s - infoH), cb(xr, b.y - 12.f * s);
-            gradRect(dl, ca, cb, withA(P.a, P.dark ? 0.16f : 0.10f), withA(P.b, P.dark ? 0.10f : 0.06f), 10.f * s, true);
-            dl->AddRect(ca, cb, U32(P.a, 0.35f), 10.f * s, 0, 1.f);
-            const bool valid = currentPreset >= 0 && currentPreset < static_cast<int>(presets.size());
-            const PresetEntry* pe = valid ? &presets[static_cast<size_t>(currentPreset)] : nullptr;
-            const int algo = algoFromParams(pv);
-            const ImVec4 ac = algoColor(algo);
-            const ImVec2 bc(ca.x + 24.f * s, ca.y + 24.f * s);
-            dl->AddRectFilled(ImVec2(bc.x - 12.f * s, bc.y - 12.f * s), ImVec2(bc.x + 12.f * s, bc.y + 12.f * s), U32(ac, 0.18f), 6.f * s);
-            drawAlgoIcon(dl, algo, bc, 7.f * s, U32(ac));
-            const float tx = ca.x + 46.f * s;
-            const std::string nm = currentName + (presetModified() ? " *" : "");
-            text(dl, fBold, ImVec2(tx, ca.y + 10.f * s), U32(P.text), fitText(fBold, nm, cb.x - tx - 12.f * s).c_str());
-            std::string line = pe != nullptr && ! pe->author.empty() ? "by " + pe->author : std::string("unknown author");
-            text(dl, fSmall, ImVec2(tx, ca.y + 30.f * s), U32(P.textDim), fitText(fSmall, line, cb.x - tx - 12.f * s).c_str());
-            // category chip + algorithm
-            float px = tx;
-            const float py = ca.y + 48.f * s;
-            if (pe != nullptr && ! pe->category.empty())
-            {
-                const float tw = textSize(fSmall, pe->category.c_str()).x;
-                dl->AddRectFilled(ImVec2(px, py), ImVec2(px + tw + 14.f * s, py + 18.f * s), U32(P.b, 0.18f), 9.f * s);
-                text(dl, fSmall, ImVec2(px + 7.f * s, py + 9.f * s - fs(fSmall) * 0.5f - 0.5f * s), U32(P.text), pe->category.c_str());
-                px += tw + 22.f * s;
-            }
-            text(dl, fSmall, ImVec2(px, py + 9.f * s - fs(fSmall) * 0.5f - 0.5f * s), U32(ac), kAlgoNames[algo]);
-            if (! valid)
-                textRight(dl, fSmall, ImVec2(cb.x - 12.f * s, ca.y + 12.f * s), U32(P.textFaint), "not saved");
-        }
-
-        // fade in with the slide
-        if (t < 1.f)
-            fadeVerts(dl, v0, 0.35f + 0.65f * t);
-        dl->PopClipRect();
-    }
+    // (preset browser dropdown is inlined in drawPresetBar for stability)
 
     static void dl_x(ImDrawList* dl, ImVec2 c, float r, ImU32 col)
     {
@@ -6723,12 +6394,12 @@ protected:
         const float H = static_cast<float>(getHeight());
         crtCount = 0;
 
-        // preset sidebar: the controls keep the width left of it
-        const float sideVis = updateSidebar();
-        const float W = WFull - sideVis;
+        // preset browser is a dropdown popup now (no window-resize/sidebar layout)
+        (void)updateSidebar();
+        const float W = WFull;
 
         // scale handling: rebuild fonts when the size settles
-        s = computeScale(sideVis);
+        s = computeScale();
         fontAdj = s / fontBuiltScale;
         if (std::fabs(fontAdj - 1.f) > 0.02f && ! resizing && ! ImGui::IsMouseDown(ImGuiMouseButton_Left))
         {
@@ -6811,9 +6482,6 @@ protected:
             drawDelayPanel(dl, ImVec2(x, cTop), ImVec2(x + wp[7], cBot));      x += wp[7] + gap;
             drawReverbPanel(dl, ImVec2(x, cTop), ImVec2(x + wp[8], cBot));     x += wp[8] + gap;
             drawMasterPanel(dl, ImVec2(x, cTop), ImVec2(W - pad, cBot));
-
-            if (sideVis > 0.5f)
-                drawPresetSidebar(dl, W, WFull, H);
 
             drawResizeGrip(dl, WFull, H);
 

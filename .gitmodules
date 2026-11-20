@@ -1,6 +1,6 @@
 [submodule "dpf-widgets"]
 	path = dpf-widgets
-	url = https://github.com/DISTRHO/DPF-Widgets.git
+	url = https://github.com/hexamorphical/DPF-Widgets.git
 [submodule "dpf"]
 	path = dpf
-	url = https://github.com/DISTRHO/DPF.git
+	url = https://github.com/hexamorphical/DPF.git

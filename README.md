@@ -28,8 +28,8 @@ HyperCut listens to your audio and cuts it up live, in time with your DAW: stutt
 euclidean retriggers, ratchet build-ups and a drawable trance gate. A chain of slice-aware effects follows it. It is
 free software under the GNU GPL.
 
-> **v0.1 beta.** The Linux build is the one in daily use. Windows and macOS builds are provided too, but have not been
-> tested on real hardware yet.
+> **v0.2.** The Windows VST3 build has been tested in a real host and fixes mouse clicks on the top controls and
+> algorithm selector. Linux remains the build in daily use; see the [changelog](CHANGELOG.md) for details.
 
 ## Contents
 
