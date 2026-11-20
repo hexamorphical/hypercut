@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.1
+
+- **Ableton Live parameter clicks fixed.** One-shot edits such as the algorithm selector now go straight through
+  `setParameterValue()` instead of a begin/perform/end gesture collapsed into one message batch, which Ableton
+  discarded. Verified in Ableton Live and REAPER.
+- **Preset browser artwork restored.** The v0.1 sidebar styling is back inside the fixed, non-resizing popup.
+
 ## v0.2
 
 - **Windows VST3 clicks fixed.** Some hosts deliver a mouse press and release in the same idle cycle. Dear ImGui
