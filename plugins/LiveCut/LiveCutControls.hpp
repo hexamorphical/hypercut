@@ -186,7 +186,10 @@ enum LiveCutControls{
     LVC_MINFEEDBACK   = 142, // delay: lower bound of the per-slice feedback range (LVC_FEEDBACK is the upper bound)
     LVC_MINDLYMIX     = 143, // delay: lower bound of the per-slice amount range (LVC_DLYMIX is the upper bound)
     LVC_DLYROUTE      = 144, // 0 = INSERT (AMOUNT is dry/wet), 1 = SEND (AMOUNT is the parallel send level)
-    LVC_CONTROL_NR    = 145
+    LVC_FILTERDRIVE   = 145, // filter input saturation, 0 = clean
+    LVC_CRUSHMIX      = 146, // crusher dry / wet (1 = fully crushed)
+    LVC_CRUSHLP       = 147, // crusher post lowpass, Hz (20000 = bypassed)
+    LVC_CONTROL_NR    = 148
 };
 
 static const std::array<std::pair<float, float>, LVC_CONTROL_NR> controlLimits =
@@ -335,7 +338,10 @@ static const std::array<std::pair<float, float>, LVC_CONTROL_NR> controlLimits =
     {0.0f, 1.0f},        // LVC_DLYTUNE
     {0.0f, 0.9f},        // LVC_MINFEEDBACK
     {0.0f, 1.0f},        // LVC_MINDLYMIX
-    {0.0f, 1.0f}         // LVC_DLYROUTE
+    {0.0f, 1.0f},        // LVC_DLYROUTE
+    {0.0f, 1.0f},        // LVC_FILTERDRIVE
+    {0.0f, 1.0f},        // LVC_CRUSHMIX
+    {20.0f, 20000.0f}    // LVC_CRUSHLP
 }};
 
 static const float LVC_DEFAULTS[LVC_CONTROL_NR] = {
@@ -484,6 +490,9 @@ static const float LVC_DEFAULTS[LVC_CONTROL_NR] = {
      0.5f,     // LVC_MINFEEDBACK (equal to LVC_FEEDBACK's default: no random spread until the range is opened)
      0.35f,    // LVC_MINDLYMIX (equal to LVC_DLYMIX's default)
      0.0f,     // LVC_DLYROUTE (insert: old sessions sound the same)
+    0.0f,     // LVC_FILTERDRIVE (clean: old sessions sound the same)
+    1.0f,     // LVC_CRUSHMIX (fully wet: old sessions sound the same)
+    20000.0f, // LVC_CRUSHLP (open: old sessions sound the same)
 };
 
 // Parameter symbols (stable identifiers used by hosts, sessions and preset files). Never reorder or rename.
@@ -633,6 +642,9 @@ static const char* const LVC_SYMBOLS[LVC_CONTROL_NR] = {
     "livecut_minfeedback",
     "livecut_mindlymix",
     "livecut_dlyroute",
+    "livecut_filterdrive",
+    "livecut_crushmix",
+    "livecut_crushlp",
 };
 
 // Chroma scales: bit i set = the note i semitones above the root belongs to the scale.

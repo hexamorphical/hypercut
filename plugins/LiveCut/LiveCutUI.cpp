@@ -213,16 +213,19 @@ struct Palette {
             rec = hex(0xE11D48);
         }
 
-        // The present rainbow sweeps through all six stripes; every other theme is a plain a->b blend.
+        // Every skin gets six stops, exactly like the website's theme picker: Spectrum uses the logo's
+        // six colours, the others interpolate their two accent colours across the ramp. The website
+        // keeps these stops in both light and dark mode, so the controls do too.
         if (theme == 0)
         {
             for (int i = 0; i < 6; ++i) gradStops[i] = kLogoRainbow[i];
-            numStops = 6;
         }
         else
         {
-            gradStops[0] = a; gradStops[1] = b; numStops = 2;
+            for (int i = 0; i < 6; ++i)
+                gradStops[i] = mix(hex(t.a), hex(t.b), i / 5.f);
         }
+        numStops = 6;
     }
 
     ImVec4 grad(float t) const
@@ -278,7 +281,7 @@ static ParamSpec specFor(uint32_t i)
     case LVC_LIMREL:   return { kMapLog, 1.f, kFmtMs };
     case LVC_RVDECAYMIN: case LVC_RVDECAYMAX: return { kMapLog, 1.f, kFmtSec };
     case LVC_LPFREQ: case LVC_HPFREQ: case LVC_LPMIN: case LVC_HPMAX:
-    case LVC_MASTERLPFREQ: case LVC_MASTERHPFREQ: return { kMapLog, 1.f, kFmtHz };
+    case LVC_MASTERLPFREQ: case LVC_MASTERHPFREQ: case LVC_CRUSHLP: return { kMapLog, 1.f, kFmtHz };
     case LVC_CHPITCH:  return { kMapInt, 1.f, kFmtSt };
     case LVC_CHTUNE:   return { kMapLin, 1.f, kFmtCents };
     case LVC_CHGAIN: case LVC_CHGATETHR: case LVC_MAKEUP: return { kMapLin, 1.f, kFmtDb };
@@ -341,6 +344,34 @@ static void formatValue(uint32_t i, float v, char* buf, size_t sz)
         if (std::fabs(v) < 0.005f) std::snprintf(buf, sz, "C");
         else std::snprintf(buf, sz, "%s%.0f", v < 0.f ? "L" : "R", std::fabs(v) * 100.f);
         break;
+    }
+}
+
+// Short spelling for the numeric readouts under a range knob: the panel is narrow, so
+// "20 Hz – 20.00 kHz" becomes "20–20k" while the tooltip keeps the full precision.
+static void formatCompact(uint32_t i, float v, char* buf, size_t sz)
+{
+    switch (specFor(i).fmt)
+    {
+    case kFmtPct:   std::snprintf(buf, sz, "%.0f%%", v * 100.f); break;
+    case kFmtMs:    std::snprintf(buf, sz, v < 10.f ? "%.1f" : "%.0f", v); break;
+    case kFmtHz:
+        if (v >= 1000.f) std::snprintf(buf, sz, "%.1fk", v / 1000.f);
+        else std::snprintf(buf, sz, "%.0f", v);
+        break;
+    case kFmtBits:  std::snprintf(buf, sz, "%.0f", v); break;
+    case kFmtInt: case kFmtBars: std::snprintf(buf, sz, "%d", static_cast<int>(std::round(v))); break;
+    case kFmtSemis: std::snprintf(buf, sz, "%+.1f", v / 100.f); break;
+    case kFmtFloat: std::snprintf(buf, sz, "%.2f", v); break;
+    case kFmtDb:    std::snprintf(buf, sz, "%.0f", v); break;
+    case kFmtSec:   std::snprintf(buf, sz, "%.1f", v); break;
+    case kFmtSt:    std::snprintf(buf, sz, "%+d", static_cast<int>(std::round(v))); break;
+    case kFmtCents: std::snprintf(buf, sz, "%+.0f", v); break;
+    case kFmtPan:
+        if (std::fabs(v) < 0.005f) std::snprintf(buf, sz, "C");
+        else std::snprintf(buf, sz, "%s%.0f", v < 0.f ? "L" : "R", std::fabs(v) * 100.f);
+        break;
+    case kFmtDiv:   std::snprintf(buf, sz, "%s", delayDiv(v).name); break;
     }
 }
 
@@ -757,7 +788,7 @@ class HyperCutUI : public UI
 
     // interaction state
     float dragNorm = 0.f;
-    int rangeHandle = 0; // 0 = min, 1 = max
+    int rangeHandle = 0; // active handle of a min/max range knob: 0 = min, 1 = max
     bool resizing = false;
     ImVec2 resizeStartMouse, resizeStartSize;
     bool cursorIsResize = false;
@@ -779,9 +810,14 @@ class HyperCutUI : public UI
     // These drive the little insets in the filter and crush panels (like the docs' visualisations).
     float fxViewBits = 32.f, fxViewRate = 44100.f, fxViewLP = 20000.f, fxViewHP = 20.f;
 
-    // Smoothed current values for the selected-value marker on every min/max range slider.
+    // Smoothed current values that rotate the pointers of the min/max range knobs.
     float rangeCurSmooth[LiveCutVis::kMaxParams] {};
     bool  rangeCurInit[LiveCutVis::kMaxParams] {};
+
+    // Sliding selection indicator for segmented controls. The second half is for alternate views
+    // of the same parameter (the gate's RATE selector and the main SUBDIVISION selector).
+    float segSelPos[LVC_CONTROL_NR * 2] {};
+    bool  segSelInit[LVC_CONTROL_NR * 2] {};
 
     // The DSP publishes the per-slice value for each range pair; return it for the UI marker.
     // -1 means "not available" (no audio running yet).
@@ -792,7 +828,12 @@ class HyperCutUI : public UI
         float& v = rangeCurSmooth[idx];
         const float target = vis->paramCurrent[idx];
         if (! rangeCurInit[idx]) { v = target; rangeCurInit[idx] = true; }
-        else v += 0.25f * (target - v);
+        else
+        {
+            // frame-rate independent smoothing: the pointer must follow fast slices without jitter
+            const float dt = limit<float>(ImGui::GetIO().DeltaTime, 1.f / 240.f, 0.1f);
+            v += (1.f - std::exp(-18.f * dt)) * (target - v);
+        }
         return v;
     }
 
@@ -1903,40 +1944,93 @@ protected:
                                                       U32(withA(c0, 1.f)), U32(withA(c1, 1.f)));
     }
 
-    // Full multi-stop sweep (used by the rainbow theme); falls back to a plain two-colour blend.
-    void gradRectTheme(ImDrawList* dl, ImVec2 a, ImVec2 b, float rounding) const
+    // The website's `url(#hc-grad)`: one full sweep, shared by every accent control.
+    // A single triangle strip carries the six-stop ramp, so rounded ends, transparency
+    // and partial corner flags all keep the same spectrum.
+    void gradRectTheme(ImDrawList* dl, ImVec2 a, ImVec2 b, float rounding,
+                       float alpha = 1.f, bool vertical = false, ImDrawFlags flags = 0) const
     {
-        if (P.numStops <= 2)
-        {
-            gradRect(dl, a, b, P.gradStops[0], P.gradStops[1], rounding, true);
-            return;
-        }
         const float w = b.x - a.x, h = b.y - a.y;
-        if (w <= 0.f || h <= 0.f) return;
+        if (w <= 0.f || h <= 0.f || alpha <= 0.f) return;
+        const bool horizontal = ! vertical;
+        const float span = horizontal ? w : h;
+        const float start = horizontal ? a.x : a.y;
         const float rad = std::min(rounding, std::min(w, h) * 0.5f);
 
-        // Draw one properly rounded shape first, so capsule ends keep their silhouette.
-        const int v0 = dl->VtxBuffer.Size;
-        dl->AddRectFilled(a, b, U32(P.gradStops[0]), rad);
-        const int v1 = dl->VtxBuffer.Size;
-        for (int i = v0; i < v1; ++i)
-        {
-            ImDrawVert& v = dl->VtxBuffer[i];
-            v.col = U32(P.grad((v.pos.x - a.x) / w));
-        }
+        ImDrawFlags cf = flags & ImDrawFlags_RoundCornersMask_;
+        if (cf == 0) cf = ImDrawFlags_RoundCornersAll;
+        const bool noRound = (cf & ImDrawFlags_RoundCornersNone) != 0;
+        const bool rTL = ! noRound && (cf & ImDrawFlags_RoundCornersTopLeft) != 0;
+        const bool rTR = ! noRound && (cf & ImDrawFlags_RoundCornersTopRight) != 0;
+        const bool rBL = ! noRound && (cf & ImDrawFlags_RoundCornersBottomLeft) != 0;
+        const bool rBR = ! noRound && (cf & ImDrawFlags_RoundCornersBottomRight) != 0;
 
-        // Refine the straight middle into per-stop slices; the arc ends already carry
-        // enough vertices for a smooth sweep on their own.
-        const float ml = a.x + rad, mr = b.x - rad;
-        if (mr > ml)
+        const int segs = std::max(4, std::min(128, static_cast<int>(span / std::max(1.f, s)) + 2));
+        const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+        dl->PrimReserve(segs * 6, (segs + 1) * 2);
+        const ImDrawIdx base = static_cast<ImDrawIdx>(dl->_VtxCurrentIdx);
+        for (int i = 0; i <= segs; ++i)
         {
-            const int segs = P.numStops - 1;
-            for (int i = 0; i < segs; ++i)
+            const float p = start + span * i / segs;
+            const ImU32 col = U32(P.grad(i / static_cast<float>(segs)), alpha);
+            float lo = 0.f, hi = 0.f;
+            if (rad > 0.f)
             {
-                const ImVec2 s0(ml + (mr - ml) * i / segs, a.y);
-                const ImVec2 s1(ml + (mr - ml) * (i + 1) / segs, b.y);
-                gradRect(dl, s0, s1, P.grad((s0.x - a.x) / w), P.grad((s1.x - a.x) / w), 0.f, true);
+                if (horizontal)
+                {
+                    if (p < a.x + rad)
+                    {
+                        const float d = a.x + rad - p;
+                        const float inset = rad - std::sqrt(std::max(0.f, rad * rad - d * d));
+                        if (rTL) lo = std::max(lo, inset);
+                        if (rBL) hi = std::max(hi, inset);
+                    }
+                    if (p > b.x - rad)
+                    {
+                        const float d = p - (b.x - rad);
+                        const float inset = rad - std::sqrt(std::max(0.f, rad * rad - d * d));
+                        if (rTR) lo = std::max(lo, inset);
+                        if (rBR) hi = std::max(hi, inset);
+                    }
+                    dl->PrimWriteVtx(ImVec2(p, a.y + lo), uv, col);
+                    dl->PrimWriteVtx(ImVec2(p, b.y - hi), uv, col);
+                }
+                else
+                {
+                    if (p < a.y + rad)
+                    {
+                        const float d = a.y + rad - p;
+                        const float inset = rad - std::sqrt(std::max(0.f, rad * rad - d * d));
+                        if (rTL) lo = std::max(lo, inset);
+                        if (rTR) hi = std::max(hi, inset);
+                    }
+                    if (p > b.y - rad)
+                    {
+                        const float d = p - (b.y - rad);
+                        const float inset = rad - std::sqrt(std::max(0.f, rad * rad - d * d));
+                        if (rBL) lo = std::max(lo, inset);
+                        if (rBR) hi = std::max(hi, inset);
+                    }
+                    dl->PrimWriteVtx(ImVec2(a.x + lo, p), uv, col);
+                    dl->PrimWriteVtx(ImVec2(b.x - hi, p), uv, col);
+                }
             }
+            else if (horizontal)
+            {
+                dl->PrimWriteVtx(ImVec2(p, a.y), uv, col);
+                dl->PrimWriteVtx(ImVec2(p, b.y), uv, col);
+            }
+            else
+            {
+                dl->PrimWriteVtx(ImVec2(a.x, p), uv, col);
+                dl->PrimWriteVtx(ImVec2(b.x, p), uv, col);
+            }
+        }
+        for (int i = 0; i < segs; ++i)
+        {
+            const ImDrawIdx q = static_cast<ImDrawIdx>(base + i * 2);
+            dl->PrimWriteIdx(q); dl->PrimWriteIdx(static_cast<ImDrawIdx>(q + 1)); dl->PrimWriteIdx(static_cast<ImDrawIdx>(q + 2));
+            dl->PrimWriteIdx(static_cast<ImDrawIdx>(q + 1)); dl->PrimWriteIdx(static_cast<ImDrawIdx>(q + 3)); dl->PrimWriteIdx(static_cast<ImDrawIdx>(q + 2));
         }
     }
 
@@ -1947,6 +2041,45 @@ protected:
         const int v1 = dl->VtxBuffer.Size;
         ImGui::ShadeVertsLinearColorGradientKeepAlpha(dl, v0, v1, ImVec2(c.x, c.y - r), ImVec2(c.x, c.y + r),
                                                       U32(withA(top, 1.f)), U32(withA(bot, 1.f)));
+    }
+
+    // Full-spectrum band along an arc: vertex colours follow the sweep, so no two
+    // knobs/ranges end up with a different pair of colours.
+    void gradArcBand(ImDrawList* dl, ImVec2 c, float r0, float r1, float a0, float a1, float alpha = 1.f)
+    {
+        if (a1 - a0 <= 0.001f || alpha <= 0.f) return;
+        const int segs = std::max(2, static_cast<int>((a1 - a0) / (IM_PI * 2.f) * 96.f) + 2);
+        const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+        dl->PrimReserve(segs * 6, (segs + 1) * 2);
+        const ImDrawIdx base = static_cast<ImDrawIdx>(dl->_VtxCurrentIdx);
+        for (int i = 0; i <= segs; ++i)
+        {
+            const float t = i / static_cast<float>(segs);
+            const float a = a0 + (a1 - a0) * t;
+            const float ca = std::cos(a), sa = std::sin(a);
+            const ImU32 col = U32(P.grad(t), alpha);
+            dl->PrimWriteVtx(ImVec2(c.x + ca * r1, c.y + sa * r1), uv, col);
+            dl->PrimWriteVtx(ImVec2(c.x + ca * r0, c.y + sa * r0), uv, col);
+        }
+        for (int i = 0; i < segs; ++i)
+        {
+            const ImDrawIdx q = static_cast<ImDrawIdx>(base + i * 2);
+            dl->PrimWriteIdx(q); dl->PrimWriteIdx(static_cast<ImDrawIdx>(q + 1)); dl->PrimWriteIdx(static_cast<ImDrawIdx>(q + 2));
+            dl->PrimWriteIdx(static_cast<ImDrawIdx>(q + 1)); dl->PrimWriteIdx(static_cast<ImDrawIdx>(q + 3)); dl->PrimWriteIdx(static_cast<ImDrawIdx>(q + 2));
+        }
+    }
+
+    void gradArc(ImDrawList* dl, ImVec2 c, float r, float a0, float a1, float thick, float alpha = 1.f)
+    {
+        if (a1 - a0 <= 0.001f || alpha <= 0.f) return;
+        gradArcBand(dl, c, r - thick * 0.5f, r + thick * 0.5f, a0, a1, alpha);
+        // round caps, like the website's stroke-linecap:round
+        for (int end = 0; end < 2; ++end)
+        {
+            const float a = end ? a1 : a0;
+            dl->AddCircleFilled(c + ImVec2(std::cos(a), std::sin(a)) * r, thick * 0.5f,
+                                U32(P.grad(end ? 1.f : 0.f), alpha), 10);
+        }
     }
 
     void glow(ImDrawList* dl, ImVec2 a, ImVec2 b, const ImVec4& col, float rounding, float strength = 1.f)
@@ -2001,9 +2134,9 @@ protected:
         return a.y + 44.f * s;
     }
 
-    void inset(ImDrawList* dl, ImVec2 a, ImVec2 b, float rounding)
+    void inset(ImDrawList* dl, ImVec2 a, ImVec2 b, float rounding, const ImVec4* fillOverride = nullptr)
     {
-        dl->AddRectFilled(a, b, U32(P.inset), rounding);
+        dl->AddRectFilled(a, b, U32(fillOverride != nullptr ? *fillOverride : P.inset), rounding);
         dl->AddRect(a, b, U32(P.insetBorder), rounding, 0, 1.f);
     }
 
@@ -2046,9 +2179,11 @@ protected:
     }
 
     // modNorm >= 0: modulation drawn on the knob (0..1 of the knob's travel: how far it is pulled now); liveText replaces the value
-    // text while the knob is not hovered or dragged
+    // text while the knob is not hovered or dragged. liveNorm >= 0 rotates the pointer to the value the DSP is using now;
+    // when omitted, any live value published for this parameter is used automatically.
     void knob(ImDrawList* dl, uint32_t idx, const char* label, ImVec2 center, float radius, bool enabled = true,
-              bool bipolar = false, float hitWidth = 0.f, float modNorm = -1.f, const char* liveText = nullptr)
+              bool bipolar = false, float hitWidth = 0.f, float modNorm = -1.f, const char* liveText = nullptr,
+              float liveNorm = -1.f)
     {
         ImGui::PushID(static_cast<int>(idx));
         const float hitW = hitWidth > 0.f ? std::max(radius * 2.f, hitWidth) : std::max(radius * 2.f, 56.f * s);
@@ -2120,18 +2255,8 @@ protected:
         if (ve - vs > 0.01f)
         {
             if (hovered || active)
-            {
-                const int g0 = dl->VtxBuffer.Size;
-                dl->PathArcTo(center, trackR, vs, ve, 40);
-                dl->PathStroke(U32(P.a, 0.22f * alpha), 0, thick * 3.f);
-                ImGui::ShadeVertsLinearColorGradientKeepAlpha(dl, g0, dl->VtxBuffer.Size,
-                    ImVec2(center.x - radius, center.y), ImVec2(center.x + radius, center.y), U32(P.a), U32(P.b));
-            }
-            const int v0 = dl->VtxBuffer.Size;
-            dl->PathArcTo(center, trackR, vs, ve, 40);
-            dl->PathStroke(U32(P.a, alpha), 0, thick);
-            ImGui::ShadeVertsLinearColorGradientKeepAlpha(dl, v0, dl->VtxBuffer.Size,
-                ImVec2(center.x - radius, center.y), ImVec2(center.x + radius, center.y), U32(P.a), U32(P.b));
+                gradArc(dl, center, trackR, vs, ve, thick * 3.f, 0.22f * alpha);
+            gradArc(dl, center, trackR, vs, ve, thick, alpha);
         }
 
         // modulation: the reachable range (0 .. the knob's setting) as a soft glowing band, the part applied right now
@@ -2143,14 +2268,14 @@ protected:
             const ImVec4 mc = mix(P.c, P.text, P.dark ? 0.15f : 0.f);
             if (av - a0 > 0.01f)
             {
-                // range: faint halo + band
-                arcBand(dl, center, rIn - thick * 1.0f, rOut + thick * 1.0f, a0, av, U32(mc, 0.09f * alpha));
-                arcBand(dl, center, rIn, rOut, a0, av, U32(mc, 0.22f * alpha));
+                // range: faint halo + band, both using the shared full spectrum
+                gradArcBand(dl, center, rIn - thick * 1.0f, rOut + thick * 1.0f, a0, av, 0.09f * alpha);
+                gradArcBand(dl, center, rIn, rOut, a0, av, 0.22f * alpha);
             }
             if (am - a0 > 0.01f)
             {
                 // live: filled band, then bloom layers from wide and faint to a hot core
-                arcBand(dl, center, rIn, rOut, a0, am, U32(mc, 0.55f * alpha));
+                gradArcBand(dl, center, rIn, rOut, a0, am, 0.55f * alpha);
                 static const float widths[4] = { 5.2f, 3.3f, 1.9f, 0.95f };
                 static const float alphas[4] = { 0.11f, 0.19f, 0.36f, 1.0f };
                 for (int k = 0; k < 4; ++k)
@@ -2175,15 +2300,31 @@ protected:
         gradCircle(dl, center, bodyR, withA(P.knobTop, alpha), withA(P.knobBot, alpha));
         dl->AddCircle(center, bodyR, U32(P.knobRim, alpha), 40, 1.f);
 
-        // pointer
-        const ImVec2 dir(std::cos(av), std::sin(av));
+        // pointer: a parameter that moves on its own follows its live value, while the end dot stays
+        // on the stored setting. While dragging, the pointer tracks the user instead.
+        float ptrNorm = norm;
+        if (liveNorm >= 0.f && ! active)
+            ptrNorm = limit<float>(liveNorm, 0.f, 1.f);
+        else if (modNorm < 0.f && ! active)
+        {
+            const float lv = currentParamValue(idx);
+            if (lv >= 0.f) ptrNorm = toNorm(idx, lv);
+        }
+        const float avPtr = a0 + (a1 - a0) * ptrNorm;
+        const ImVec2 dir(std::cos(avPtr), std::sin(avPtr));
         const ImVec2 p0(center.x + dir.x * bodyR * 0.30f, center.y + dir.y * bodyR * 0.30f);
         const ImVec2 p1(center.x + dir.x * bodyR * 0.82f, center.y + dir.y * bodyR * 0.82f);
-        dl->AddLine(p0, p1, U32(P.text, alpha), std::max(1.5f, 2.2f * s));
+        dl->AddLine(p0, p1, U32(std::fabs(ptrNorm - norm) < 0.001f ? P.text : P.c, alpha), std::max(1.5f, 2.2f * s));
+        if (std::fabs(ptrNorm - norm) > 0.01f)
+        {
+            const ImVec2 lp(center.x + dir.x * trackR, center.y + dir.y * trackR);
+            dl->AddCircleFilled(lp, thick * 1.5f, U32(P.c, 0.16f * alpha), 16);
+            dl->AddCircleFilled(lp, thick * 0.55f, U32(P.c, alpha), 12);
+        }
 
-        // end dot on arc
-        const ImVec2 dot(center.x + dir.x * trackR, center.y + dir.y * trackR);
-        dl->AddCircleFilled(dot, thick * 0.9f, U32(mix(P.a, P.b, norm), alpha), 16);
+        // end dot on arc: the value that is stored in the patch
+        const ImVec2 dot(center.x + std::cos(av) * trackR, center.y + std::sin(av) * trackR);
+        dl->AddCircleFilled(dot, thick * 0.9f, U32(P.grad(norm), alpha), 16);
         if (active)
             dl->AddCircleFilled(dot, thick * 2.0f, U32(P.b, 0.25f), 16);
 
@@ -2204,67 +2345,52 @@ protected:
         ImGui::PopID();
     }
 
-    // Horizontal dual-handle range slider for a min/max parameter pair.
-    // multiply the alpha of everything drawn since vertex v0 (used to dim disabled controls)
-    static void fadeVerts(ImDrawList* dl, int v0, float factor)
+    // Circular min/max knob for a pair of related parameters (a Serum-style modulation range).
+    // The outer arc is the range the DSP picks from, its two ends are the min and max handles, and the
+    // knob's pointer rotates to the value picked for the slice that is playing.
+    void rangeKnob(ImDrawList* dl, uint32_t idxMin, uint32_t idxMax, const char* label, ImVec2 a, float width,
+                   bool bipolar = false, bool enabled = true, float radius = 0.f, bool compact = false)
     {
-        for (int i = v0; i < dl->VtxBuffer.Size; ++i)
-        {
-            ImU32& c = dl->VtxBuffer[i].col;
-            const ImU32 a = static_cast<ImU32>(((c >> IM_COL32_A_SHIFT) & 0xFF) * factor);
-            c = (c & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT);
-        }
-    }
+        if (radius <= 0.f) radius = 14.f * s;
+        const float alpha = enabled ? 1.f : 0.38f;
+        const float fsh = fs(fSmall);
+        // the knob sits in the middle of its row and the label + values go underneath it,
+        // exactly like every other knob in the UI. Compact mode is for side-by-side groups:
+        // it shows only the live value (the full range stays in the tooltip).
+        const float rowH = radius * 2.f + 13.f * s + fsh * (compact ? 1.7f : 2.1f);
+        const ImVec2 c(a.x + width * 0.5f, a.y + radius + 6.f * s);
+        const float a0 = IM_PI * 0.75f, a1 = IM_PI * 2.25f, span = a1 - a0;
+        const float trackR = radius, thick = std::max(1.5f, (compact ? 2.f : 2.8f) * s);
 
-    void rangeSlider(ImDrawList* dl, uint32_t idxMin, uint32_t idxMax, const char* label, ImVec2 a, float width,
-                     bool bipolar = false, bool enabled = true)
-    {
-        const int fadeFrom = dl->VtxBuffer.Size;
-        struct FadeGuard {
-            ImDrawList* dl; int v0; bool on;
-            ~FadeGuard() { if (on) fadeVerts(dl, v0, 0.45f); }
-        } fadeGuard { dl, fadeFrom, ! enabled };
         ImGui::PushID(static_cast<int>(idxMin * 100 + idxMax));
-        const float labelH = fs(fSmall) + 6.f * s;
-        const float trackY = a.y + labelH + 9.f * s;
-        const float handleR = 7.f * s;
-        const float x0 = a.x + handleR, x1 = a.x + width - handleR;
-
-        // label row
-        char bmin[24], bmax[24], base[64], val[96], cbuf[24] = "";
-        formatValue(idxMin, pv[idxMin], bmin, sizeof(bmin));
-        formatValue(idxMax, pv[idxMax], bmax, sizeof(bmax));
-        if (std::strcmp(bmin, bmax) == 0)
-            std::snprintf(base, sizeof(base), "%s", bmin);
-        else
-            std::snprintf(base, sizeof(base), "%s  \xe2\x80\x93  %s", bmin, bmax); // en dash (UTF-8)
-        const float cur = currentParamValue(idxMin);
-        if (cur >= 0.f)
-            formatValue(idxMin, cur, cbuf, sizeof(cbuf));
-        if (cbuf[0])
-            std::snprintf(val, sizeof(val), "%s  (%s)", base, cbuf);
-        else
-            std::snprintf(val, sizeof(val), "%s", base);
-
-        ImGui::SetCursorScreenPos(ImVec2(a.x, trackY - 11.f * s));
-        ImGui::InvisibleButton("##range", ImVec2(width, 22.f * s));
+        ImGui::SetCursorScreenPos(a);
+        ImGui::InvisibleButton("##rangeKnob", ImVec2(width, rowH));
         const bool hovered = ImGui::IsItemHovered();
         const bool active = ImGui::IsItemActive();
         const ImGuiIO& io = ImGui::GetIO();
 
+        // Angle of the mouse around the knob, folded into the 270-degree arc. The small gap at the
+        // top maps to whichever end of the arc is closer.
+        auto mouseNorm = [&]() -> float {
+            const float ang0 = std::atan2(io.MousePos.y - c.y, io.MousePos.x - c.x);
+            float ang = ang0;
+            if (ang < a0) ang += IM_PI * 2.f;
+            if (ang > a1)
+            {
+                const float wrap = ang - IM_PI * 2.f;
+                ang = std::fabs(wrap - a0) < std::fabs(ang - a1) ? a0 : a1;
+            }
+            return limit<float>((ang - a0) / span, 0.f, 1.f);
+        };
+
         float nMin = toNorm(idxMin, pv[idxMin]);
         float nMax = toNorm(idxMax, pv[idxMax]);
-
-        auto mouseNorm = [&]() { return std::max(0.f, std::min(1.f, (io.MousePos.x - x0) / (x1 - x0))); };
 
         if (ImGui::IsItemActivated())
         {
             const float m = mouseNorm();
-            const float lo = std::min(nMin, nMax), hi = std::max(nMin, nMax);
-            if (std::fabs(hi - lo) < 1e-4f)
-                rangeHandle = (m < lo) ? 0 : 1;
-            else
-                rangeHandle = (std::fabs(m - nMin) <= std::fabs(m - nMax)) ? 0 : 1;
+            const float d0 = std::fabs(m - nMin), d1 = std::fabs(m - nMax);
+            rangeHandle = (std::fabs(d0 - d1) < 0.02f) ? (m <= (nMin + nMax) * 0.5f ? 0 : 1) : (d0 <= d1 ? 0 : 1);
             editParameter(idxMin, true);
             editParameter(idxMax, true);
         }
@@ -2277,10 +2403,28 @@ protected:
         else if (active)
         {
             const float m = mouseNorm();
-            if (rangeHandle == 0)
-                setParam(idxMin, fromNorm(idxMin, std::min(m, nMax)));
+            if (rangeHandle == 0) setParam(idxMin, fromNorm(idxMin, std::min(m, nMax)));
+            else                  setParam(idxMax, fromNorm(idxMax, std::max(m, nMin)));
+        }
+        else if (hovered && io.MouseWheel != 0.f)
+        {
+            const float m = mouseNorm();
+            const uint32_t target = std::fabs(m - nMin) <= std::fabs(m - nMax) ? idxMin : idxMax;
+            if (specFor(target).map == kMapInt)
+            {
+                const float spanVal = controlLimits[target].second - controlLimits[target].first;
+                float v = pv[target] + (io.MouseWheel > 0.f ? 1.f : -1.f) * (spanVal > 0.f ? 1.f : 0.f);
+                if (target == idxMin) v = std::min(v, pv[idxMax]);
+                else                  v = std::max(v, pv[idxMin]);
+                setParamGesture(target, v);
+            }
             else
-                setParam(idxMax, fromNorm(idxMax, std::max(m, nMin)));
+            {
+                float n = toNorm(target, pv[target]) + io.MouseWheel * (io.KeyShift ? 0.005f : 0.03f);
+                if (target == idxMin) n = std::min(n, nMax);
+                else                  n = std::max(n, nMin);
+                setParamGesture(target, fromNorm(target, n));
+            }
         }
 
         if (ImGui::IsItemDeactivated())
@@ -2291,40 +2435,218 @@ protected:
 
         nMin = toNorm(idxMin, pv[idxMin]);
         nMax = toNorm(idxMax, pv[idxMax]);
-
-        // label + value text
-        text(dl, fSmall, a, U32(P.textDim), label);
-        textRight(dl, fSmall, ImVec2(a.x + width, a.y), active || hovered ? U32(P.grad(0.6f)) : U32(P.text, 0.85f), val);
+        const float lo = std::min(nMin, nMax), hi = std::max(nMin, nMax);
+        const float alo = a0 + span * lo, ahi = a0 + span * hi;
 
         // track
-        const float th = 4.f * s;
-        dl->AddRectFilled(ImVec2(x0 - handleR * 0.5f, trackY - th * 0.5f), ImVec2(x1 + handleR * 0.5f, trackY + th * 0.5f),
-                          U32(P.track), th);
+        dl->PathArcTo(c, trackR, a0, a1, 48);
+        dl->PathStroke(U32(P.track, alpha), 0, thick);
 
-        // integer tick marks
+        // integer steps and the centre mark of a bipolar range
         if (specFor(idxMin).map == kMapInt)
         {
             const int steps = static_cast<int>(controlLimits[idxMin].second - controlLimits[idxMin].first);
             for (int k = 0; k <= steps && steps > 0; ++k)
             {
-                const float x = x0 + (x1 - x0) * k / static_cast<float>(steps);
-                dl->AddCircleFilled(ImVec2(x, trackY + 9.f * s), 1.3f * s, U32(P.textFaint), 8);
+                const float ang = a0 + span * k / static_cast<float>(steps);
+                const ImVec2 p(static_cast<float>(std::cos(ang)), static_cast<float>(std::sin(ang)));
+                dl->AddLine(c + p * (trackR + 2.f * s), c + p * (trackR + 4.f * s), U32(P.textFaint, alpha), 1.f);
             }
         }
         if (bipolar)
         {
-            const float xm = (x0 + x1) * 0.5f;
-            dl->AddLine(ImVec2(xm, trackY - 7.f * s), ImVec2(xm, trackY + 7.f * s), U32(P.textFaint), 1.f);
+            const float ang = (a0 + a1) * 0.5f;
+            const ImVec2 p(static_cast<float>(std::cos(ang)), static_cast<float>(std::sin(ang)));
+            dl->AddLine(c + p * (trackR - 3.f * s), c + p * (trackR + 3.f * s), U32(P.textFaint, alpha), 1.f);
         }
 
-        // fill
-        const float lo = std::min(nMin, nMax), hi = std::max(nMin, nMax);
-        const float fx0 = x0 + (x1 - x0) * lo, fx1 = x0 + (x1 - x0) * hi;
+        // modulation range: a soft halo and a gradient band between the two handles
+        const float rIn = trackR + (compact ? 1.5f : 2.f) * s;
+        const float rOut = trackR + (compact ? 4.f : 7.f) * s;
+        if (hi - lo > 0.002f)
+        {
+            gradArcBand(dl, c, rIn - 2.f * s, rOut + 2.f * s, alo, ahi, 0.10f * alpha);
+            gradArcBand(dl, c, rIn, rOut, alo, ahi, (hovered || active ? 0.55f : 0.40f) * alpha);
+        }
+        else
+        {
+            const ImVec2 p(std::cos(alo), std::sin(alo));
+            dl->AddCircleFilled(c + p * (rIn + rOut) * 0.5f, thick * 1.4f,
+                                U32(P.grad((alo - a0) / span), 0.45f * alpha), 16);
+        }
+
+        // the value playing now, clamped to the range the user set. When audio hasn't published one
+        // yet, the pointer rests in the middle of the range.
+        const float cur = currentParamValue(idxMin);
+        float live = cur >= 0.f ? toNorm(idxMin, cur) : (lo + hi) * 0.5f;
+        live = limit<float>(live, lo, hi);
+        const float angLive = a0 + span * live;
+        const ImVec2 dirLive(std::cos(angLive), std::sin(angLive));
+
+        // knob body + pointer
+        const float bodyR = trackR * 0.66f;
+        dl->AddCircleFilled(c + ImVec2(0.f, 1.5f * s), bodyR + 1.f * s, U32(P.shadow, 0.75f * alpha), 32);
+        gradCircle(dl, c, bodyR, withA(P.knobTop, alpha), withA(P.knobBot, alpha));
+        dl->AddCircle(c, bodyR, U32(P.knobRim, alpha), 32, 1.f);
+        dl->AddLine(c + dirLive * (bodyR * 0.18f), c + dirLive * (bodyR * 0.84f),
+                    U32(cur >= 0.f ? P.c : P.text, alpha), std::max(1.5f, 2.f * s));
+        dl->AddCircleFilled(c, thick * 0.6f, U32(P.textDim, alpha), 12);
+
+        // glowing bead riding the arc at the live value
+        const ImVec2 bead = c + dirLive * (rOut + (compact ? 1.f : 2.f) * s);
+        dl->AddCircleFilled(bead, thick * 2.2f, U32(P.c, 0.13f * alpha), 16);
+        dl->AddCircleFilled(bead, thick * 0.85f, U32(P.c, alpha), 12);
+
+        // the two handles, drawn last so they stay on top of the band
+        for (int h = 0; h < 2; ++h)
+        {
+            const float n = h == 0 ? nMin : nMax;
+            const float ang = a0 + span * n;
+            const ImVec2 p = c + ImVec2(std::cos(ang), std::sin(ang)) * ((rIn + rOut) * 0.5f);
+            const bool hot = active && rangeHandle == h;
+            const ImVec4 col = h == 0 ? P.a : P.b;
+            dl->AddCircleFilled(p, thick * (hot ? 3.0f : 2.1f), U32(col, (hot ? 0.30f : 0.16f) * alpha), 16);
+            gradCircle(dl, p, thick * 1.25f, withA(P.knobTop, alpha), withA(P.knobBot, alpha));
+            dl->AddCircle(p, thick * 1.25f, U32(col, alpha), 16, hot ? 2.f * s : 1.2f * s);
+        }
+
+        // label and readouts centred underneath the knob
+        const float ly = c.y + radius + 6.f * s;
+        textCentered(dl, fSmall, ImVec2(c.x, ly + fsh * 0.5f), U32(P.textDim, alpha), label);
+        char bmin[24], bmax[24], range[72], bcur[24];
+        formatCompact(idxMin, pv[idxMin], bmin, sizeof(bmin));
+        formatCompact(idxMax, pv[idxMax], bmax, sizeof(bmax));
+        if (std::strcmp(bmin, bmax) == 0) std::snprintf(range, sizeof(range), "%s", bmin);
+        else std::snprintf(range, sizeof(range), "%s \xe2\x80\x93 %s", bmin, bmax); // en dash (UTF-8)
+        char display[100];
+        if (compact)
+        {
+            // in a group there is only room for one short number; the tooltip has the exact bounds
+            if (cur >= 0.f)
+            {
+                formatCompact(idxMin, cur, bcur, sizeof(bcur));
+                std::snprintf(display, sizeof(display), "%s", bcur);
+            }
+            else
+                std::snprintf(display, sizeof(display), "%s", range);
+        }
+        else if (cur >= 0.f)
+        {
+            formatCompact(idxMin, cur, bcur, sizeof(bcur));
+            std::snprintf(display, sizeof(display), "%s (%s)", range, bcur);
+        }
+        else
+            std::snprintf(display, sizeof(display), "%s", range);
+        textCentered(dl, fSmall, ImVec2(c.x, ly + fsh * 1.55f),
+                     U32(hovered || active ? P.grad(0.6f) : (cur >= 0.f ? P.c : P.text), (hovered || active ? 1.f : 0.85f) * alpha), display);
+
+        if (hovered || active)
+        {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            char full[256];
+            formatValue(idxMin, pv[idxMin], bmin, sizeof(bmin));
+            formatValue(idxMax, pv[idxMax], bmax, sizeof(bmax));
+            if (cur >= 0.f)
+            {
+                formatValue(idxMin, cur, bcur, sizeof(bcur));
+                std::snprintf(full, sizeof(full), "%s: %s \xe2\x80\x93 %s (now %s)\nDrag either end of the arc, wheel to fine-tune, double-click to reset.",
+                              label, bmin, bmax, bcur);
+            }
+            else
+                std::snprintf(full, sizeof(full), "%s: %s \xe2\x80\x93 %s\nDrag either end of the arc, wheel to fine-tune, double-click to reset.",
+                              label, bmin, bmax);
+            tooltip("%s", full);
+        }
+
+        ImGui::PopID();
+    }
+
+    // Horizontal range control for the pitchmap's frequency region. The track is the log-frequency
+    // spectrum the region selects, so the two handles slide along the same axis the analyser uses.
+    void spectrumRangeSlider(ImDrawList* dl, uint32_t idxMin, uint32_t idxMax, const char* label,
+                             ImVec2 a, float width, bool enabled = true)
+    {
+        const float alpha = enabled ? 1.f : 0.38f;
+        const float fsh = fs(fSmall);
+        const float trackY = a.y + 27.f * s;
+        const float handleR = 6.f * s;
+        const float x0 = a.x + handleR, x1 = a.x + width - handleR;
+        const float rowH = 42.f * s + fsh * 2.1f;
+
+        ImGui::PushID(static_cast<int>(idxMin * 100 + idxMax));
+        ImGui::SetCursorScreenPos(a);
+        ImGui::InvisibleButton("##spectrumRange", ImVec2(width, rowH));
+        const bool hovered = ImGui::IsItemHovered();
+        const bool active = ImGui::IsItemActive();
+        const ImGuiIO& io = ImGui::GetIO();
+
+        float nMin = toNorm(idxMin, pv[idxMin]);
+        float nMax = toNorm(idxMax, pv[idxMax]);
+        auto mouseNorm = [&]() { return limit<float>((io.MousePos.x - x0) / (x1 - x0), 0.f, 1.f); };
+
+        if (ImGui::IsItemActivated())
+        {
+            const float m = mouseNorm();
+            rangeHandle = (std::fabs(m - nMin) <= std::fabs(m - nMax)) ? 0 : 1;
+            editParameter(idxMin, true);
+            editParameter(idxMax, true);
+        }
+        if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+        {
+            setParam(idxMin, LVC_DEFAULTS[idxMin]);
+            setParam(idxMax, LVC_DEFAULTS[idxMax]);
+        }
+        else if (active)
+        {
+            const float m = mouseNorm();
+            if (rangeHandle == 0) setParam(idxMin, fromNorm(idxMin, std::min(m, nMax)));
+            else                  setParam(idxMax, fromNorm(idxMax, std::max(m, nMin)));
+        }
+        else if (hovered && io.MouseWheel != 0.f)
+        {
+            const uint32_t target = std::fabs(mouseNorm() - nMin) <= std::fabs(mouseNorm() - nMax) ? idxMin : idxMax;
+            const float v = pv[target] * std::pow(2.f, io.MouseWheel > 0.f ? 1.f / 12.f : -1.f / 12.f);
+            if (target == idxMin) setParamGesture(idxMin, std::min(v, pv[idxMax] / 1.2f));
+            else                  setParamGesture(idxMax, std::max(v, pv[idxMin] * 1.2f));
+        }
+        if (ImGui::IsItemDeactivated())
+        {
+            editParameter(idxMin, false);
+            editParameter(idxMax, false);
+        }
+
+        nMin = toNorm(idxMin, pv[idxMin]);
+        nMax = toNorm(idxMax, pv[idxMax]);
+
+        // spectrum scale: decade labels and a small tick for every third octave
+        static const float decades[3] = { 100.f, 1000.f, 10000.f };
+        for (int k = 0; k < 3; ++k)
+        {
+            const float n = toNorm(idxMin, decades[k]);
+            const float x = x0 + (x1 - x0) * n;
+            char lb[16];
+            if (decades[k] >= 1000.f) std::snprintf(lb, sizeof(lb), "%gk", decades[k] / 1000.f);
+            else std::snprintf(lb, sizeof(lb), "%g", decades[k]);
+            textCentered(dl, fSmall, ImVec2(x, a.y), U32(P.textFaint, 0.85f * alpha), lb);
+            dl->AddLine(ImVec2(x, a.y + fsh + 2.f * s), ImVec2(x, a.y + fsh + 7.f * s), U32(P.textFaint, 0.5f * alpha), 1.f);
+        }
+        for (int k = 0; k <= 24; ++k)
+        {
+            const float x = x0 + (x1 - x0) * k / 24.f;
+            dl->AddLine(ImVec2(x, trackY - 9.f * s), ImVec2(x, trackY - 6.f * s), U32(P.textFaint, 0.28f * alpha), 1.f);
+        }
+
+        // track and selected range
+        const float th = 4.f * s;
+        dl->AddRectFilled(ImVec2(x0 - handleR * 0.5f, trackY - th * 0.5f),
+                          ImVec2(x1 + handleR * 0.5f, trackY + th * 0.5f), U32(P.track, alpha), th);
+        const float loN = std::min(nMin, nMax), hiN = std::max(nMin, nMax);
+        const float fx0 = x0 + (x1 - x0) * loN, fx1 = x0 + (x1 - x0) * hiN;
         if (hovered || active)
             dl->AddRectFilled(ImVec2(fx0, trackY - th * 1.5f), ImVec2(std::max(fx1, fx0 + 1.f), trackY + th * 1.5f),
-                              U32(P.a, 0.18f), th * 1.5f);
-        gradRect(dl, ImVec2(fx0, trackY - th * 0.5f), ImVec2(std::max(fx1, fx0 + 1.f), trackY + th * 0.5f),
-                 P.grad(lo), P.grad(hi), th * 0.5f, true);
+                              U32(P.a, 0.18f * alpha), th * 1.5f);
+        gradRectTheme(dl, ImVec2(fx0, trackY - th * 0.5f), ImVec2(std::max(fx1, fx0 + 1.f), trackY + th * 0.5f),
+                      th * 0.5f, alpha);
 
         // handles
         for (int h = 0; h < 2; ++h)
@@ -2332,42 +2654,89 @@ protected:
             const float n = h == 0 ? nMin : nMax;
             const ImVec2 c(x0 + (x1 - x0) * n, trackY);
             const bool hot = active && rangeHandle == h;
-            dl->AddCircleFilled(ImVec2(c.x, c.y + 1.5f * s), handleR, U32(P.shadow), 24);
-            gradCircle(dl, c, handleR, P.knobTop, P.knobBot);
-            dl->AddCircle(c, handleR, U32(P.grad(n), hot ? 1.f : 0.85f), 24, hot ? 2.2f * s : 1.6f * s);
-            if (hot)
-                dl->AddCircleFilled(c, handleR * 2.f, U32(P.grad(n), 0.15f), 24);
+            dl->AddCircleFilled(ImVec2(c.x, c.y + 1.5f * s), handleR, U32(P.shadow, alpha), 24);
+            gradCircle(dl, c, handleR, withA(P.knobTop, alpha), withA(P.knobBot, alpha));
+            dl->AddCircle(c, handleR, U32(h == 0 ? P.a : P.b, (hot ? 1.f : 0.85f) * alpha), 24,
+                          hot ? 2.2f * s : 1.6f * s);
+            if (hot) dl->AddCircleFilled(c, handleR * 2.f, U32(h == 0 ? P.a : P.b, 0.15f * alpha), 24);
         }
 
-        // selected per-slice value: thin needle + small triangle above the track
+        // the loudest note currently in the region, as a marker on the same spectrum
+        const float cur = currentParamValue(idxMin);
         if (cur >= 0.f)
         {
-            const float nc = std::max(0.f, std::min(1.f, toNorm(idxMin, cur)));
+            const float nc = limit<float>(toNorm(idxMin, cur), 0.f, 1.f);
             const float cx = x0 + (x1 - x0) * nc;
-            dl->AddLine(ImVec2(cx, trackY - 7.f * s), ImVec2(cx, trackY + 7.f * s), U32(P.text, 0.9f), 2.f * s);
-            dl->AddTriangleFilled(ImVec2(cx - 4.f * s, trackY - 12.f * s),
-                                  ImVec2(cx + 4.f * s, trackY - 12.f * s),
-                                  ImVec2(cx, trackY - 6.f * s), U32(P.a, 0.95f));
+            dl->AddLine(ImVec2(cx, trackY - 7.f * s), ImVec2(cx, trackY + 7.f * s), U32(P.text, 0.9f * alpha), 2.f * s);
+            dl->AddTriangleFilled(ImVec2(cx - 4.f * s, trackY - 13.f * s),
+                                  ImVec2(cx + 4.f * s, trackY - 13.f * s),
+                                  ImVec2(cx, trackY - 7.f * s), U32(P.a, alpha));
         }
 
+        char bmin[24], bmax[24], range[72], bcur[24], display[100];
+        formatCompact(idxMin, pv[idxMin], bmin, sizeof(bmin));
+        formatCompact(idxMax, pv[idxMax], bmax, sizeof(bmax));
+        if (std::strcmp(bmin, bmax) == 0) std::snprintf(range, sizeof(range), "%s", bmin);
+        else std::snprintf(range, sizeof(range), "%s \xe2\x80\x93 %s", bmin, bmax);
+        if (cur >= 0.f)
+        {
+            formatCompact(idxMin, cur, bcur, sizeof(bcur));
+            std::snprintf(display, sizeof(display), "%s (%s)", range, bcur);
+        }
+        else
+            std::snprintf(display, sizeof(display), "%s", range);
+        textCentered(dl, fSmall, ImVec2(a.x + width * 0.5f, a.y + 38.f * s + fsh * 0.5f),
+                     U32(P.textDim, alpha), label);
+        textCentered(dl, fSmall, ImVec2(a.x + width * 0.5f, a.y + 38.f * s + fsh * 1.55f),
+                     U32(hovered || active ? P.grad(0.6f) : (cur >= 0.f ? P.c : P.text),
+                         (hovered || active ? 1.f : 0.85f) * alpha), display);
+
         if (hovered || active)
-            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            char full[256];
+            formatValue(idxMin, pv[idxMin], bmin, sizeof(bmin));
+            formatValue(idxMax, pv[idxMax], bmax, sizeof(bmax));
+            if (cur >= 0.f)
+            {
+                formatValue(idxMin, cur, bcur, sizeof(bcur));
+                std::snprintf(full, sizeof(full), "%s: %s \xe2\x80\x93 %s (now %s)\nDrag either edge, wheel to fine-tune, double-click to reset.",
+                              label, bmin, bmax, bcur);
+            }
+            else
+                std::snprintf(full, sizeof(full), "%s: %s \xe2\x80\x93 %s\nDrag either edge, wheel to fine-tune, double-click to reset.",
+                              label, bmin, bmax);
+            tooltip("%s", full);
+        }
 
         ImGui::PopID();
     }
 
-    // Segmented control for an enumerated/integer parameter
-    void segmented(ImDrawList* dl, uint32_t idx, const char* const* labels, int count, ImVec2 a, ImVec2 b,
-                   bool enabled = true, const bool* marks = nullptr)
+    // Segmented control for an enumerated/integer parameter. When `values` is supplied the labels map to
+    // those parameter values (the gate's musical RATE names map onto subdivision indices). The selected
+    // highlight glides to its new segment instead of jumping.
+    bool segmented(ImDrawList* dl, uint32_t idx, const char* const* labels, int count, ImVec2 a, ImVec2 b,
+                   bool enabled = true, const bool* marks = nullptr, const int* values = nullptr, int animKey = 0)
     {
         ImGui::PushID(static_cast<int>(idx) + 5000);
+        ImGui::PushID(animKey);
         const float rounding = (b.y - a.y) * 0.32f;
         inset(dl, a, b, rounding);
         const float pad = 3.f * s;
-        const float w = (b.x - a.x - pad * 2.f) / count;
-        const int cur = static_cast<int>(std::round(pv[idx] - controlLimits[idx].first));
+        const float w = (b.x - a.x - pad * 2.f) / std::max(1, count);
         const float alpha = enabled ? 1.f : 0.5f;
+        const float first = controlLimits[idx].first;
 
+        auto selectedIndex = [&]() {
+            const int raw = static_cast<int>(std::round(pv[idx] - first));
+            if (values == nullptr) return limit<int>(raw, 0, count - 1);
+            for (int i = 0; i < count; ++i)
+                if (values[i] == raw) return i;
+            return 0;
+        };
+
+        bool clicked = false;
+        std::vector<bool> hovered(std::max(1, count), false);
         for (int i = 0; i < count; ++i)
         {
             const ImVec2 ia(a.x + pad + w * i, a.y + pad);
@@ -2375,31 +2744,55 @@ protected:
             ImGui::PushID(i);
             ImGui::SetCursorScreenPos(ia);
             if (ImGui::InvisibleButton("##seg", ImVec2(w, ib.y - ia.y)))
-                setParamGesture(idx, controlLimits[idx].first + static_cast<float>(i));
-            const bool hovered = ImGui::IsItemHovered();
+            {
+                setParamGesture(idx, values == nullptr ? first + static_cast<float>(i) : static_cast<float>(values[i]));
+                clicked = true;
+            }
+            hovered[i] = ImGui::IsItemHovered();
             ImGui::PopID();
+        }
 
-            if (i == cur)
-            {
-                gradRect(dl, ia, ib, P.grad(count > 1 ? i / float(count - 1) * 0.6f : 0.f),
-                         P.grad(count > 1 ? 0.4f + i / float(count - 1) * 0.6f : 1.f), rounding - pad * 0.5f, true);
-                textCentered(dl, fBold, ImVec2((ia.x + ib.x) * 0.5f, (ia.y + ib.y) * 0.5f), U32(P.onAccent, alpha),
-                             labels[i]);
-            }
-            else
-            {
-                if (hovered)
-                    dl->AddRectFilled(ia, ib, U32(P.text, 0.06f), rounding - pad * 0.5f);
-                textCentered(dl, fBold, ImVec2((ia.x + ib.x) * 0.5f, (ia.y + ib.y) * 0.5f),
-                             U32(hovered ? P.text : P.textDim, alpha), labels[i]);
-            }
+        const int cur = selectedIndex();
+        const int slot = limit<int>(static_cast<int>(idx) + animKey * static_cast<int>(LVC_CONTROL_NR),
+                                    0, static_cast<int>(LVC_CONTROL_NR) * 2 - 1);
+        float& pos = segSelPos[slot];
+        if (! segSelInit[slot]) { pos = static_cast<float>(cur); segSelInit[slot] = true; }
+        else
+        {
+            const float dt = limit<float>(ImGui::GetIO().DeltaTime, 1.f / 240.f, 0.1f);
+            pos += (1.f - std::exp(-12.f * dt)) * (static_cast<float>(cur) - pos);
+        }
+
+        // hover backgrounds first, then the single highlight that slides between segments
+        for (int i = 0; i < count; ++i)
+        {
+            if (! hovered[i] || i == cur) continue;
+            const ImVec2 ia(a.x + pad + w * i, a.y + pad);
+            const ImVec2 ib(ia.x + w, b.y - pad);
+            dl->AddRectFilled(ia, ib, U32(P.text, 0.06f), rounding - pad * 0.5f);
+        }
+        const ImVec2 ha(a.x + pad + w * pos, a.y + pad);
+        const ImVec2 hb(ha.x + w, b.y - pad);
+        const float hr = rounding - pad * 0.5f;
+        // softer fill under the label so the selected value stays readable
+        gradRectTheme(dl, ha, hb, hr, 0.60f * alpha);
+
+        for (int i = 0; i < count; ++i)
+        {
+            const ImVec2 ia(a.x + pad + w * i, a.y + pad);
+            const ImVec2 ib(ia.x + w, b.y - pad);
+            const bool isCur = i == cur;
+            textCentered(dl, fBold, ImVec2((ia.x + ib.x) * 0.5f, (ia.y + ib.y) * 0.5f),
+                         U32(isCur ? P.onAccent : (hovered[i] ? P.text : P.textDim), alpha), labels[i]);
             if (marks != nullptr && marks[i])
                 dl->AddCircleFilled(ImVec2((ia.x + ib.x) * 0.5f, ib.y - 3.5f * s), 1.8f * s,
-                                    i == cur ? U32(P.onAccent, alpha) : U32(P.c, alpha), 8);
-            if (hovered)
+                                    isCur ? U32(P.onAccent, alpha) : U32(P.c, alpha), 8);
+            if (hovered[i])
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         }
         ImGui::PopID();
+        ImGui::PopID();
+        return clicked;
     }
 
     // Pill on/off switch for a boolean parameter
@@ -2413,16 +2806,14 @@ protected:
         const bool hovered = ImGui::IsItemHovered();
         const bool on = pv[idx] > 0.5f;
         const ImVec2 b(a.x + w, a.y + h);
+        const float tr = h * 0.5f;
 
         if (on)
-        {
-            glow(dl, a, b, P.a, h * 0.5f, 0.6f);
-            gradRect(dl, a, b, P.a, P.b, h * 0.5f, true);
-        }
+            gradRectTheme(dl, a, b, tr);
         else
         {
-            dl->AddRectFilled(a, b, U32(P.track, hovered ? 1.6f : 1.f), h * 0.5f);
-            dl->AddRect(a, b, U32(P.panelBorder), h * 0.5f, 0, 1.f);
+            dl->AddRectFilled(a, b, U32(P.track, hovered ? 1.6f : 1.f), tr);
+            dl->AddRect(a, b, U32(P.panelBorder), tr, 0, 1.f);
         }
         const float r = h * 0.5f - 3.f * s;
         const ImVec2 c(on ? b.x - h * 0.5f : a.x + h * 0.5f, a.y + h * 0.5f);
@@ -3373,8 +3764,8 @@ protected:
         // selected preset card at the bottom
         {
             const ImVec2 ca(x, b.y - 12.f * s - infoH), cb(xr, b.y - 12.f * s);
-            gradRect(dl, ca, cb, withA(P.a, P.dark ? 0.16f : 0.10f), withA(P.b, P.dark ? 0.10f : 0.06f), 10.f * s, true);
-            dl->AddRect(ca, cb, U32(P.a, 0.35f), 10.f * s, 0, 1.f);
+            gradRectTheme(dl, ca, cb, 10.f * s, P.dark ? 0.13f : 0.08f);
+            dl->AddRect(ca, cb, U32(P.grad(0.5f), 0.35f), 10.f * s, 0, 1.f);
             const bool valid = currentPreset >= 0 && currentPreset < static_cast<int>(presets.size());
             const PresetEntry* pe = valid ? &presets[static_cast<size_t>(currentPreset)] : nullptr;
             const int algo = algoFromParams(pv);
@@ -3728,7 +4119,7 @@ protected:
     {
         const float r = (m.b.y - m.a.y) * 0.5f;
         dl->AddRectFilled(m.a, m.b, U32(P.inset, 0.9f), r);
-        dl->AddRect(m.a, m.b, on ? U32(col, 0.8f) : U32(P.panelBorder), r, 0, 1.f);
+        dl->AddRect(m.a, m.b, on ? U32(col, 0.6f) : U32(P.panelBorder), r, 0, 1.f);
         dl->AddCircleFilled(ImVec2(m.a.x + 9.f * s, (m.a.y + m.b.y) * 0.5f), 3.f * s, on ? U32(col) : U32(P.textFaint), 12);
         text(dl, fSmall, ImVec2(m.a.x + 16.f * s, m.a.y + (m.b.y - m.a.y - fs(fSmall)) * 0.5f - 0.5f * s),
              U32(on ? P.text : (m.hovered ? P.textDim : P.textFaint)), label);
@@ -3805,8 +4196,8 @@ protected:
         if (active)
         {
             const float ce = X(cutEnd), de = X(dutyEnd), cs = X(cutStart);
-            gradRect(dl, ImVec2(cs, ia.y + 4.f * s), ImVec2(std::max(cs + 1.f, de), ib.y - 4.f * s),
-                     withA(P.a, 0.10f), withA(P.b, 0.10f), 6.f * s, true);
+            gradRectTheme(dl, ImVec2(cs, ia.y + 4.f * s), ImVec2(std::max(cs + 1.f, de), ib.y - 4.f * s),
+                          6.f * s, 0.10f);
             if (ce > de + 1.f)
             {
                 // duty-cycle "off" part: hatched
@@ -3988,7 +4379,9 @@ protected:
         const ImVec2 sa(ia.x, pb.y + gapY), sb = ib;
 
         // ===== phrase map (trance gate: a one-bar step sequencer instead) =====
-        inset(dl, pa, pb, 10.f * s);
+        // The gate's unfilled area is fully transparent, so use a pure black/white backdrop there.
+        const ImVec4 gateInset = P.dark ? hex(0x000000) : hex(0xFFFFFF);
+        inset(dl, pa, pb, 10.f * s, &gateInset);
         if (algoFromParams(pv) == kAlgoGate)
             drawGateSequencer(dl, pa, pb, dryNow);
         else
@@ -4402,18 +4795,16 @@ protected:
         const bool clicked = ImGui::InvisibleButton(id, b - a) && enabled;
         const bool hov = ImGui::IsItemHovered() && enabled;
         const float rr = (b.y - a.y) * 0.5f;
+        const float en = enabled ? 1.f : 0.4f;
         if (lit)
-        {
-            glow(dl, a, b, P.c, rr, 0.7f);
-            gradRectTheme(dl, a, b, rr);
-            textCentered(dl, fBold, (a + b) * 0.5f, U32(P.onAccent), label);
-        }
+            gradRectTheme(dl, a, b, rr, 0.60f * en);
         else
         {
             dl->AddRectFilled(a, b, U32(P.text, hov ? 0.10f : 0.05f), rr);
             dl->AddRect(a, b, U32(hov ? withA(P.c, 0.6f) : P.panelBorder), rr, 0, 1.f);
-            textCentered(dl, fBold, (a + b) * 0.5f, U32(enabled ? (hov ? P.text : P.textDim) : P.textFaint), label);
         }
+        textCentered(dl, fBold, (a + b) * 0.5f,
+                     U32(lit ? P.onAccent : (enabled ? (hov ? P.text : P.textDim) : P.textFaint)), label);
         if (hov)
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         return clicked;
@@ -4479,13 +4870,13 @@ protected:
         segmented(dl, LVC_MINCUT, mincut, 3, ImVec2(x0, y), ImVec2(x1, y + 26.f * s));
         y += 26.f * s + 16.f * s;
 
-        rangeSlider(dl, LVC_MINPHRS, LVC_MAXPHRS, "PHRASE (BARS)", ImVec2(x0, y), w);
-        y += 50.f * s;
+        rangeKnob(dl, LVC_MINPHRS, LVC_MAXPHRS, "PHRASE (BARS)", ImVec2(x0, y), w);
+        y += 64.f * s;
 
         // ---- fill mode ----
-        dl->AddLine(ImVec2(x0, y - 6.f * s), ImVec2(x1, y - 6.f * s), U32(P.panelBorder), 1.f);
+        dl->AddLine(ImVec2(x0, y + 2.f * s), ImVec2(x1, y + 2.f * s), U32(P.panelBorder), 1.f);
         const bool fillOn = pv[LVC_FILLMODE] > 0.5f;
-        y += 2.f * s;
+        y += 10.f * s;
         fxHeader(dl, x0, x1, y, "FILL MODE", LVC_FILLMODE);
         y += 28.f * s;
 
@@ -4505,7 +4896,7 @@ protected:
             const int fbars = std::min(cycle, static_cast<int>(LVC_FILLBARS_OPTIONS[std::max(0, std::min(3, static_cast<int>(pv[LVC_FILLBARS] + 0.5f)))]));
             const int cur = (vis != nullptr && vis->fillMode.load(std::memory_order_relaxed))
                           ? vis->barInCycle.load(std::memory_order_relaxed) : -1;
-            const float ch = std::min(12.f * s, b.y - 14.f * s - y);
+            const float ch = std::max(10.f * s, b.y - 14.f * s - y);
             if (ch > 3.f * s)
             {
                 const float cw = w / cycle;
@@ -4515,7 +4906,7 @@ protected:
                     const bool isFill = i >= cycle - fbars;
                     const float al = fillOn ? 1.f : 0.4f;
                     if (isFill)
-                        gradRect(dl, ca, cb, withA(P.b, al), withA(P.c, al), 2.f * s, true);
+                        gradRectTheme(dl, ca, cb, 2.f * s, al);
                     else
                         dl->AddRectFilled(ca, cb, U32(P.track, 1.2f), 2.f * s);
                     if (i == cur && fillOn)
@@ -4550,8 +4941,8 @@ protected:
             knob(dl, LVC_STUTTER, "STUTTER", ImVec2(x0 + w * 0.25f, y + r), r);
             knob(dl, LVC_AREA, "AREA", ImVec2(x0 + w * 0.75f, y + r), r);
             y += row;
-            rangeSlider(dl, LVC_MINREP, LVC_MAXREP, "REPEATS", ImVec2(x0, y), w);
-            y += 46.f * s;
+            rangeKnob(dl, LVC_MINREP, LVC_MAXREP, "REPEATS", ImVec2(x0, y), w);
+            y += 64.f * s;
             break;
         case kAlgoWarpCut:
             knob(dl, LVC_STRAIGHT, "STRAIGHT", ImVec2(x0 + w * 0.25f, y + r), r);
@@ -4589,24 +4980,18 @@ protected:
                 textRight(dl, fSmall, ImVec2(x1, y), U32(P.textFaint), "length of one step");
                 y += fs(fSmall) + 6.f * s;
                 int opts[7], nOpts = 0;
-                char labels[7][16];
+                char labelBuf[7][16];
+                const char* labels[7];
                 for (int i = 0; i < 7; ++i)
-                    if (subdivInfo(i, labels[nOpts], sizeof(labels[0])) != kSubOther)
-                        opts[nOpts++] = i;
-                const int cur = limit<int>(static_cast<int>(pv[LVC_SUBDIV] + 0.5f), 0, 6);
-                const float bh = 24.f * s, gap = 3.f * s;
-                const float bw = (w - gap * (nOpts - 1)) / std::max(1, nOpts);
-                for (int k = 0; k < nOpts; ++k)
-                {
-                    const ImVec2 ba(x0 + k * (bw + gap), y), bb(ba.x + bw, y + bh);
-                    ImGui::PushID(k + 860);
-                    if (pillButton(dl, "##gaterate", labels[k], ba, bb, opts[k] == cur))
+                    if (subdivInfo(i, labelBuf[nOpts], sizeof(labelBuf[0])) != kSubOther)
                     {
-                        setParamGesture(LVC_SUBDIV, static_cast<float>(opts[k]));
-                        commitUndo(true);
+                        labels[nOpts] = labelBuf[nOpts];
+                        opts[nOpts++] = i;
                     }
-                    ImGui::PopID();
-                }
+                const float bh = 24.f * s;
+                if (segmented(dl, LVC_SUBDIV, labels, nOpts, ImVec2(x0, y), ImVec2(x1, y + bh),
+                              true, nullptr, opts, 1))
+                    commitUndo(true);
                 y += bh + 10.f * s;
             }
             static const char* const modes[2] = { "RANDOM", "PATTERN" };
@@ -4635,11 +5020,11 @@ protected:
                 hz(gateHighpassHz(hp, env), th, sizeof(th));
                 const float k = 1.f - env;
                 knob(dl, LVC_GATEVOL, "VOLUME", ImVec2(x0 + w / 6.f, y + r), r, true, false, w / 3.f,
-                     live ? vol * k : 0.f, live && vol > 0.f ? tv : nullptr);
+                     live ? vol * k : 0.f, live && vol > 0.f ? tv : nullptr, live ? 1.f - vol * k : -1.f);
                 knob(dl, LVC_GATELP, "LOWPASS", ImVec2(x0 + w * 0.5f, y + r), r, true, false, w / 3.f,
-                     live ? lp * k : 0.f, live && lp > 0.f ? tl : nullptr);
+                     live ? lp * k : 0.f, live && lp > 0.f ? tl : nullptr, live ? lp * k : -1.f);
                 knob(dl, LVC_GATEHP, "HIGHPASS", ImVec2(x0 + w * 5.f / 6.f, y + r), r, true, false, w / 3.f,
-                     live ? hp * k : 0.f, live && hp > 0.f ? th : nullptr);
+                     live ? hp * k : 0.f, live && hp > 0.f ? th : nullptr, live ? hp * k : -1.f);
             }
             y += row;
             textCentered(dl, fSmall, ImVec2((x0 + x1) * 0.5f, y), U32(P.textFaint), "draw the steps in the LIVE CUTS view");
@@ -4923,7 +5308,8 @@ protected:
         const int playing = barPos >= 0.f ? std::min(n - 1, static_cast<int>(barPos)) : -1;
         const float duty = limit<float>(pv[LVC_DUTY], 0.f, 1.f);
         const float dim = dryNow ? 0.4f : 1.f;
-        const float al = (random ? 0.7f : 0.9f) * dim;
+        const float fillAl = 0.25f * dim; // only the area under the automation is tinted
+        const float lineAl = 1.00f * dim;
         const int perBeat = std::max(1, n / 4);
         const bool beatsEven = n % 4 == 0;
         const float rr = std::min(4.f * s, cw * 0.3f);
@@ -4942,23 +5328,39 @@ protected:
             while (tied[end]) ++end;
             const ImVec2 ra = cellA(st), rb = cellB(end);
             const bool beat = beatsEven ? st % perBeat == 0 : (st * 4) % n == 0;
-            dl->AddRectFilled(ra, rb, U32(P.track, ! open[st] && beat ? 1.6f : 1.f), rr);
+            // Open steps have no cell fill: the area above the envelope is transparent, so the dark/light
+            // inset shows through. Muted steps keep a faint track so their slots remain readable.
+            if (! open[st])
+                dl->AddRectFilled(ra, rb, U32(P.track, beat ? 1.6f : 1.f), rr);
 
             if (open[st])
             {
-                // one gradient across the whole run; each step's envelope cuts its part of it
-                auto colAt = [&](float x) { return withA(mix(P.b, P.a, (x - ra.x) / std::max(1.f, rb.x - ra.x)), al); };
+                // one full-spectrum sweep across the whole run; each step's envelope cuts its part of it
+                const float runW = std::max(1.f, rb.x - ra.x);
+                auto gradT = [&](float x) { return limit<float>((x - ra.x) / runW, 0.f, 1.f); };
+                auto colAt = [&](float x) { return withA(P.grad(gradT(x)), fillAl); };
+                auto lineAt = [&](float x, float alpha) { return withA(P.grad(gradT(x)), alpha); };
+                const float coreTh = std::max(1.f, 1.5f * s);
+                auto bloomLine = [&](ImVec2 p0, ImVec2 p1, float mul = 1.f)
+                {
+                    const float xm = (p0.x + p1.x) * 0.5f;
+                    dl->AddLine(p0, p1, U32(lineAt(xm, 0.08f * lineAl * mul)), coreTh + 6.f * s);
+                    dl->AddLine(p0, p1, U32(lineAt(xm, 0.18f * lineAl * mul)), coreTh + 3.f * s);
+                    dl->AddLine(p0, p1, U32(lineAt(xm, lineAl * mul)), coreTh);
+                };
                 bool anyShaped = false;
                 for (int k = st; k <= end; ++k) anyShaped = anyShaped || shape[k] != 0;
-                if (end > st)
-                    gradRect(dl, ra, rb, withA(P.b, 0.12f * dim), withA(P.a, 0.12f * dim), rr, true); // run background
                 // the slice ends after the gate length of its last step
                 const ImVec2 la = cellA(end), lb = cellB(end);
                 const float gateEnd = la.x + std::max(3.f * s, (lb.x - la.x) * duty);
                 if (! anyShaped)
                 {
                     const ImVec2 fb(gateEnd, rb.y);
-                    gradRect(dl, ra, fb, colAt(ra.x), colAt(fb.x), rr, true);
+                    gradRectTheme(dl, ra, fb, rr, fillAl);
+                    // with no attack/decay the automation is a square wave: keep its top edge visible
+                    const ImVec2 topB(fb.x, ra.y);
+                    bloomLine(ImVec2(ra.x, ra.y), topB);
+                    bloomLine(topB, fb, 0.7f);
                 }
                 else
                 {
@@ -4968,8 +5370,11 @@ protected:
                         const float gw = k < end ? (cb.x - ca.x) : std::max(3.f * s, (cb.x - ca.x) * duty);
                         if (shape[k] == 0)
                         {
-                            dl->AddRectFilledMultiColor(ca, ImVec2(ca.x + gw, cb.y), U32(colAt(ca.x)), U32(colAt(ca.x + gw)),
-                                                        U32(colAt(ca.x + gw)), U32(colAt(ca.x)));
+                            const ImVec2 flatB(ca.x + gw, cb.y), flatTopB(flatB.x, cb.y - H);
+                            dl->AddRectFilledMultiColor(ca, flatB, U32(colAt(ca.x)), U32(colAt(flatB.x)),
+                                                        U32(colAt(flatB.x)), U32(colAt(ca.x)));
+                            bloomLine(ImVec2(ca.x, cb.y - H), flatTopB);
+                            bloomLine(flatTopB, flatB, 0.7f);
                             continue;
                         }
                         const float fa = shape[k] > 0 ? GateEnvFraction(shape[k]) : 0.f;
@@ -4988,7 +5393,9 @@ protected:
                             xs[q] = xq; ys[q] = pts[q].y; yb[q] = cb.y; cs[q] = U32(colAt(xq));
                         }
                         fillBand(dl, xs, ys, yb, cs, K + 1);
-                        dl->AddPolyline(pts, K + 1, U32(P.text, 0.6f * dim), 0, std::max(1.f, 1.2f * s));
+                        // gradient automation line with a soft bloom around it
+                        for (int q = 0; q < K; ++q)
+                            bloomLine(pts[q], pts[q + 1]);
                     }
                 }
                 if (duty < 0.98f || anyShaped)
@@ -5011,13 +5418,8 @@ protected:
         for (int st = 0; st < n; ++st)
         {
             const ImVec2 ca = cellA(st), cb = cellB(st);
-            if (st == playing)
-            {
-                if (open[st])
-                    glow(dl, ca, cb, P.b, rr, 1.1f);
-                dl->AddRect(ca, cb, U32(P.text, 0.95f), rr, 0, 1.5f * s);
-            }
-            else if (st == hoverStep)
+            // the playhead dot is the only position marker; no selected-cell outline or rectangular glow
+            if (st == hoverStep && st != playing)
             {
                 dl->AddRectFilled(ca, cb, U32(P.text, 0.06f), rr);
                 dl->AddRect(ca, cb, U32(P.text, 0.55f), rr, 0, 1.f * s);
@@ -5034,11 +5436,28 @@ protected:
                 dl->AddCircleFilled(ImVec2(rx, gy1 + rulerH * 0.5f + 2.f * s), 1.3f * s, U32(P.textFaint, 0.8f), 8);
         }
 
-        // moving playhead line
-        if (barPos >= 0.f)
+        // the playhead is a glowing point on the automation, not a full line across the steps
+        if (playing >= 0 && open[playing])
         {
-            const float px = x0 + barPos * cw;
-            dl->AddLine(ImVec2(px, gy0 - 3.f * s), ImVec2(px, gy1 + 3.f * s), U32(P.text, 0.8f), 1.5f * s);
+            int runStart = playing, runEnd = playing;
+            while (runStart > 0 && tied[runStart - 1]) --runStart;
+            while (runEnd + 1 < n && tied[runEnd]) ++runEnd;
+
+            const ImVec2 ca = cellA(playing), cb = cellB(playing);
+            const float gw = playing < runEnd ? (cb.x - ca.x) : std::max(3.f * s, (cb.x - ca.x) * duty);
+            const float u = limit<float>(barPos - playing, 0.f, 1.f);
+            const float fa = shape[playing] > 0 ? GateEnvFraction(shape[playing]) : 0.f;
+            const float fd = shape[playing] < 0 ? GateEnvFraction(-shape[playing]) : 0.f;
+            const float envT = (playing < runEnd ? 1.f : duty) * u;
+            const ImVec2 dot(ca.x + gw * u, cb.y - H * GateEnvelope(envT, fa, fd, tension[playing]));
+            const ImVec2 runA = cellA(runStart), runB = cellB(runEnd);
+            const float t = limit<float>((dot.x - runA.x) / std::max(1.f, runB.x - runA.x), 0.f, 1.f);
+            const ImVec4 dotCol = P.grad(t);
+            dl->AddCircleFilled(dot, 12.f * s, U32(dotCol, 0.06f), 24);
+            dl->AddCircleFilled(dot, 8.f * s, U32(dotCol, 0.13f), 24);
+            dl->AddCircleFilled(dot, 5.f * s, U32(dotCol, 0.30f), 20);
+            dl->AddCircleFilled(dot, 3.f * s, U32(dotCol, 1.00f), 16);
+            dl->AddCircleFilled(dot, 1.1f * s, U32(P.text, 0.95f), 12);
         }
 
         if (dryNow)
@@ -5069,7 +5488,7 @@ protected:
             {
                 const ImVec2 fb(ca.x + std::max(2.f * s, (cb.x - ca.x) * std::min(1.f, c.duty)), cb.y);
                 const float al = ci == rep ? 1.f : (ci < rep ? 0.65f : 0.4f);
-                gradRect(dl, ca, fb, withA(P.b, al), withA(P.a, al), 3.f * s);
+                gradRectTheme(dl, ca, fb, 3.f * s, al);
                 if (ci == rep)
                     glow(dl, ca, fb, P.b, 3.f * s, 1.3f);
             }
@@ -5349,7 +5768,7 @@ protected:
             bool isHit = false;
             for (int hpos : hits) isHit = isHit || hpos == i;
             if (isHit)
-                gradRect(dl, ca, cbb, withA(P.b, 0.55f), withA(P.a, 0.55f), 3.f * s);
+                gradRectTheme(dl, ca, cbb, 3.f * s, 0.55f);
             else
                 dl->AddRectFilled(ca, cbb, U32(P.track), 3.f * s);
         }
@@ -5357,8 +5776,8 @@ protected:
         {
             const int h = hits[rep], src = sources[rep];
             const ImVec2 ca(a.x + h * cw + 1.f * s, y0), cbb(a.x + (h + 1) * cw - 1.f * s, y1);
-            glow(dl, ca, cbb, P.b, 3.f * s, 1.4f);
-            gradRect(dl, ca, cbb, P.b, P.a, 3.f * s);
+            glow(dl, ca, cbb, P.grad(0.5f), 3.f * s, 1.4f);
+            gradRectTheme(dl, ca, cbb, 3.f * s);
             dl->AddRect(ca, cbb, U32(P.text), 3.f * s, 0, 1.5f * s);
             // the slice being replayed
             const ImVec2 sa(a.x + src * cw + 1.f * s, y0), sb(a.x + (src + 1) * cw - 1.f * s, y1);
@@ -5387,20 +5806,31 @@ protected:
         const float x0 = a.x + 16.f * s, x1 = b.x - 16.f * s;
         const float w = x1 - x0;
 
-        rangeSlider(dl, LVC_MINAMP, LVC_MAXAMP, "AMPLITUDE", ImVec2(x0, y), w);
-        y += 50.f * s;
-        rangeSlider(dl, LVC_MINPAN, LVC_MAXPAN, "PAN", ImVec2(x0, y), w, true);
-        y += 50.f * s;
-        rangeSlider(dl, LVC_MINPITCH, LVC_MAXPITCH, "PITCH", ImVec2(x0, y), w, true);
-        y += 56.f * s;
+        // the three random ranges form one compact row instead of three full-width rows
+        const float cw3 = w / 3.f, rr = 12.f * s;
+        text(dl, fSmall, ImVec2(x0, y), U32(P.textDim), "PER-SLICE RANGES");
+        y += fs(fSmall) + 4.f * s;
+        rangeKnob(dl, LVC_MINAMP, LVC_MAXAMP, "AMP", ImVec2(x0, y), cw3, false, true, rr, true);
+        rangeKnob(dl, LVC_MINPAN, LVC_MAXPAN, "PAN", ImVec2(x0 + cw3, y), cw3, true, true, rr, true);
+        rangeKnob(dl, LVC_MINPITCH, LVC_MAXPITCH, "PITCH", ImVec2(x0 + cw3 * 2.f, y), cw3, true, true, rr, true);
+        y += rr * 2.f + 13.f * s + fs(fSmall) * 1.7f + 7.f * s;
 
-        const float r = 16.f * s;
-        const float cw = w / 2.f;
-        const float row = r * 2.f + 38.f * s;
-        knob(dl, LVC_DUTY, "DUTY", ImVec2(x0 + cw * 0.5f, y + r), r, true, false, cw);
-        knob(dl, LVC_FILLDUTY, "FILL DUTY", ImVec2(x0 + cw * 1.5f, y + r), r, true, false, cw);
-        knob(dl, LVC_FADE, "FADE", ImVec2(x0 + cw * 0.5f, y + row + r), r, true, false, cw);
-        knob(dl, LVC_SEED, "SEED", ImVec2(x0 + cw * 1.5f, y + row + r), r, true, false, cw);
+        text(dl, fSmall, ImVec2(x0, y), U32(P.textDim), "SLICE SHAPE");
+        y += fs(fSmall) + 6.f * s;
+
+        // 2 x 2 grid: size the knobs from the space that is left, so no gap is wasted
+        const float cw2 = w * 0.5f;
+        const float gridTop = y, gridBot = b.y - 12.f * s;
+        const float rowH = (gridBot - gridTop) * 0.5f;
+        const float r = std::max(14.f * s, std::min(cw2 * 0.5f - 8.f * s, rowH * 0.5f - 22.f * s));
+        static const uint32_t idx[4] = { LVC_DUTY, LVC_FILLDUTY, LVC_FADE, LVC_SEED };
+        static const char* const lbl[4] = { "DUTY", "FILL DUTY", "FADE", "SEED" };
+        for (int k = 0; k < 4; ++k)
+        {
+            const float cx = x0 + cw2 * (k % 2 + 0.5f);
+            const float cy = gridTop + rowH * (k / 2) + (rowH - 2.f * r - 32.f * s) * 0.5f + r;
+            knob(dl, idx[k], lbl[k], ImVec2(cx, cy), r, true, false, cw2);
+        }
     }
 
     void fxHeader(ImDrawList* dl, float x0, float x1, float y, const char* title, int toggleParam)
@@ -5475,8 +5905,8 @@ protected:
         dl->PopClipRect();
     }
 
-    // Tiny oscilloscope from the docs: a faint untouched sine behind the current quantised / sample-held
-    // version, with a live bit-depth readout.
+    // Tiny oscilloscope from the docs: one cycle of a faint untouched sine behind the current quantised /
+    // sample-held version, with a live bit-depth readout.
     void drawCrushScope(ImDrawList* dl, float x0, float x1, float y0, float y1, bool on)
     {
         const float alpha = on ? 1.f : 0.32f;
@@ -5491,7 +5921,7 @@ protected:
         for (int i = 0; i <= 48; ++i)
         {
             const float u = i / 48.f;
-            ref[i] = ImVec2(xL + (xR - xL) * u, mid - std::sin(u * 4.f * IM_PI) * amp);
+            ref[i] = ImVec2(xL + (xR - xL) * u, mid - std::sin(u * 2.f * IM_PI) * amp);
         }
         dl->AddPolyline(ref, 49, U32(P.textDim, 0.16f), 0, std::max(1.f, 1.f * s));
 
@@ -5507,15 +5937,18 @@ protected:
         for (int i = 1; i <= points; ++i)
         {
             const float u = static_cast<float>(i) / points;
-            const float v = std::round(std::sin(u * 4.f * IM_PI) * levels) / levels;
+            const float v = std::round(std::sin(u * 2.f * IM_PI) * levels) / levels;
             const float y = mid - v * amp;
             const float x = xL + (xR - xL) * u;
             stair[nPts++] = ImVec2(x, prevY);
             stair[nPts++] = ImVec2(x, y);
             prevY = y;
         }
-        dl->AddPolyline(stair, nPts, U32(P.grad(0.45f), 0.13f * alpha), 0, 5.f * s);
-        dl->AddPolyline(stair, nPts, U32(P.grad(0.7f), 0.95f * alpha), 0, std::max(1.f, 1.6f * s));
+        dl->AddPolyline(stair, nPts, U32(P.grad(0.5f), 0.13f * alpha), 0, 5.f * s);
+        // same full-spectrum stroke as the filter response, one sweep across the cycle
+        for (int i = 0; i < nPts - 1; ++i)
+            dl->AddLine(stair[i], stair[i + 1], U32(P.grad(i / static_cast<float>(nPts - 1)), 0.95f * alpha),
+                        std::max(1.f, 1.6f * s));
 
         char buf[24];
         std::snprintf(buf, sizeof(buf), "%.0f bit", bits);
@@ -5533,19 +5966,23 @@ protected:
         float y = top - 4.f * s;
         fxHeader(dl, x0, x1, y, "PER SLICE", LVC_FILTER);
         y += 30.f * s;
-        rangeSlider(dl, LVC_LPMIN, LVC_LPFREQ, "LOWPASS", ImVec2(x0, y), w, false, on);
-        y += 46.f * s;
-        rangeSlider(dl, LVC_HPFREQ, LVC_HPMAX, "HIGHPASS", ImVec2(x0, y), w, false, on);
-        y += 50.f * s;
-        const float r = 19.f * s;
-        const float ky = std::min(y + 20.f * s + r, b.y - 14.f * s - r - 32.f * s);
-        knob(dl, LVC_RESO, "RESO", ImVec2((x0 + x1) * 0.5f, ky), r, on, false, w);
+        const float cw2 = w * 0.5f, rr = 12.f * s;
+        rangeKnob(dl, LVC_LPMIN, LVC_LPFREQ, "LOWPASS", ImVec2(x0, y), cw2, false, on, rr, true);
+        rangeKnob(dl, LVC_HPFREQ, LVC_HPMAX, "HIGHPASS", ImVec2(x0 + cw2, y), cw2, false, on, rr, true);
+        y += rr * 2.f + 13.f * s + fs(fSmall) * 1.7f + 10.f * s;
+        // resonance and its new saturation control share the row above the response graph
+        const float r = 15.f * s;
+        knob(dl, LVC_RESO, "RESO", ImVec2(x0 + cw2 * 0.5f, y + r + 6.f * s), r, on, false, cw2);
+        knob(dl, LVC_FILTERDRIVE, "DRIVE", ImVec2(x0 + cw2 * 1.5f, y + r + 6.f * s), r, on, false, cw2);
+        if (ImGui::IsItemHovered())
+            tooltip("Overdrive the signal before the filter. Low levels gain harmonics while full-scale peaks stay near their original level.");
+        y += r * 2.f + 38.f * s;
 
         float bits = 0.f, rate = 0.f, lp = 0.f, hp = 0.f;
         readFxScope(bits, rate, lp, hp);
         fxViewLP += (lp - fxViewLP) * 0.3f;
         fxViewHP += (hp - fxViewHP) * 0.3f;
-        const float ih = std::min(64.f * s, (b.y - a.y) * 0.18f);
+        const float ih = std::min(140.f * s, std::max(48.f * s, b.y - 14.f * s - y - 4.f * s));
         drawFilterResponse(dl, x0, x1, b.y - 14.f * s - ih, b.y - 14.f * s, on);
     }
 
@@ -5559,27 +5996,32 @@ protected:
         float y = top - 4.f * s;
         fxHeader(dl, x0, x1, y, "PER SLICE", LVC_CRUSHER);
         y += 30.f * s;
-        rangeSlider(dl, LVC_MINBITS, LVC_MAXBITS, "BITS", ImVec2(x0, y), w, false, on);
-        y += 46.f * s;
-        rangeSlider(dl, LVC_MINFREQ, LVC_MAXFREQ, "RATE", ImVec2(x0, y), w, false, on);
+        const float cw2 = w * 0.5f, rr = 12.f * s;
+        rangeKnob(dl, LVC_MINBITS, LVC_MAXBITS, "BITS", ImVec2(x0, y), cw2, false, on, rr, true);
+        rangeKnob(dl, LVC_MINFREQ, LVC_MAXFREQ, "RATE", ImVec2(x0 + cw2, y), cw2, false, on, rr, true);
+        y += rr * 2.f + 13.f * s + fs(fSmall) * 1.7f + 8.f * s;
+
+        // post-processing: blend the crushed signal with the dry one, then tame its digital edges
+        const float r = 14.f * s;
+        knob(dl, LVC_CRUSHMIX, "MIX", ImVec2(x0 + cw2 * 0.5f, y + r + 6.f * s), r, on, false, cw2);
+        if (ImGui::IsItemHovered())
+            tooltip("Dry / wet balance of the crusher. 100 % is fully crushed.");
+        knob(dl, LVC_CRUSHLP, "POST LP", ImVec2(x0 + cw2 * 1.5f, y + r + 6.f * s), r, on, false, cw2);
+        if (ImGui::IsItemHovered())
+            tooltip("Lowpass after the bit and sample-rate reduction. Fully open leaves the crusher untouched.");
+        y += r * 2.f + 34.f * s;
 
         float bits = 0.f, rate = 0.f, lp = 0.f, hp = 0.f;
         readFxScope(bits, rate, lp, hp);
         fxViewBits += (bits - fxViewBits) * 0.35f;
         fxViewRate += (rate - fxViewRate) * 0.35f;
-        const float ih = std::min(150.f * s, b.y - 14.f * s - (y + 12.f * s));
+        const float ih = std::max(60.f * s, b.y - 14.f * s - y - 8.f * s);
         if (ih > 40.f * s)
             drawCrushScope(dl, x0, x1, b.y - 14.f * s - ih, b.y - 14.f * s, on);
     }
 
     // delay module, ECHO mode: stereo mode, time (note values or ms), feedback / mix / tone
-    // ---- delay TUNE: the note grid is the pitchmap's key / scale (its TUNE moves A4) ----
-    int tunedNote(double seconds) const
-    {
-        int m = 69;
-        lvcTunedPeriod(seconds, chromaMask(), lvcTuneRefA4(pv[LVC_CHTUNE]), &m);
-        return m;
-    }
+    // delay TUNE uses the pitchmap's key / scale (its TUNE moves A4) for the note grid.
 
     // echo knob text when tuned: the note for pitched times (up to 50 ms = 20 Hz), the snapped time beyond that
     void tunedTimeText(float ms, char* buf, size_t n) const
@@ -5594,7 +6036,7 @@ protected:
             std::snprintf(buf, n, "%.2f s", sec);
     }
 
-    void drawEchoControls(ImDrawList* dl, float x0, float x1, float y, bool on)
+    void drawEchoControls(ImDrawList* dl, float x0, float x1, float y, float bottom, bool on)
     {
         const float w = x1 - x0;
         static const char* const st[3] = { "MONO", "L / R", "PING" };
@@ -5634,7 +6076,15 @@ protected:
         y += 22.f * s;
 
         const bool stereo = static_cast<int>(pv[LVC_DLYSTEREO] + 0.5f) == 1;
-        const float r = 17.f * s;
+        const bool sendRoute = pv[LVC_DLYROUTE] > 0.5f;
+        const float cw3 = w / 3.f;
+
+        // time knobs take the remaining height above the grouped feedback / amount / tone row
+        const float bottomRowH = 64.f * s;
+        const float timeTop = y, timeBot = bottom - 14.f * s - bottomRowH;
+        const float timeH = std::max(56.f * s, timeBot - timeTop);
+        const float r = std::max(13.f * s, std::min(cw3 * 0.5f - 4.f * s, timeH * 0.5f - 22.f * s));
+        const float tcy = timeTop + (timeH - 2.f * r - 32.f * s) * 0.5f + r;
         const uint32_t il = sync ? LVC_DLYTIMEL : LVC_DLYMSL, ir = sync ? LVC_DLYTIMER : LVC_DLYMSR;
         char noteL[24] = "", noteR[24] = "";
         if (tuned)
@@ -5642,19 +6092,15 @@ protected:
             tunedTimeText(pv[LVC_DLYMSL], noteL, sizeof(noteL));
             tunedTimeText(pv[LVC_DLYMSR], noteR, sizeof(noteR));
         }
-        knob(dl, il, stereo ? "LEFT" : "TIME", ImVec2(x0 + w * 0.25f, y + r), r, on, false, w * 0.5f, -1.f, tuned ? noteL : nullptr);
-        knob(dl, ir, "RIGHT", ImVec2(x0 + w * 0.75f, y + r), r, on && stereo, false, w * 0.5f, -1.f, tuned ? noteR : nullptr);
-        y += r * 2.f + 30.f * s;
+        knob(dl, il, stereo ? "LEFT" : "TIME", ImVec2(x0 + cw3 * 0.5f, tcy), r, on, false, cw3, -1.f, tuned ? noteL : nullptr);
+        knob(dl, ir, "RIGHT", ImVec2(x0 + cw3 * 1.5f, tcy), r, on && stereo, false, cw3, -1.f, tuned ? noteR : nullptr);
+        y = timeBot;
 
-        // feedback and amount are per-slice random ranges, just like the comb's TIME.
-        // AMOUNT means send level in SEND mode and dry/wet in INSERT mode.
-        const bool sendRoute = pv[LVC_DLYROUTE] > 0.5f;
-        rangeSlider(dl, LVC_MINFEEDBACK, LVC_FEEDBACK, "FEEDBACK", ImVec2(x0, y), w, false, on);
-        y += 38.f * s;
-        rangeSlider(dl, LVC_MINDLYMIX, LVC_DLYMIX, sendRoute ? "SEND" : "DRY / WET", ImVec2(x0, y), w, false, on);
-        y += 38.f * s;
-        const float r2 = 13.f * s;
-        knob(dl, LVC_DLYTONE, "TONE", ImVec2((x0 + x1) * 0.5f, y + r2), r2, on, false, w);
+        // feedback and amount are per-slice random ranges; TONE completes the group
+        const float rr = 9.f * s, rt = 13.f * s;
+        rangeKnob(dl, LVC_MINFEEDBACK, LVC_FEEDBACK, "FB", ImVec2(x0, y), cw3, false, on, rr, true);
+        rangeKnob(dl, LVC_MINDLYMIX, LVC_DLYMIX, sendRoute ? "SEND" : "MIX", ImVec2(x0 + cw3, y), cw3, false, on, rr, true);
+        knob(dl, LVC_DLYTONE, "TONE", ImVec2(x0 + cw3 * 2.5f, y + rt + 4.f * s), rt, on, false, cw3);
     }
 
     void drawDelayPanel(ImDrawList* dl, ImVec2 a, ImVec2 b)
@@ -5682,7 +6128,7 @@ protected:
         y += 26.f * s;
         if (echo)
         {
-            drawEchoControls(dl, x0, x1, y, on);
+            drawEchoControls(dl, x0, x1, y, b.y, on);
             return;
         }
         // comb delay: feed-forward or feedback
@@ -5700,24 +6146,11 @@ protected:
             tooltip("Tune: each slice's comb delay snaps to a note of the pitchmap's key and scale,\n"
                     "so the comb rings in key (FB rings the most). Set the scale in SPECTRAL PITCHMAP.");
         y += 52.f * s;
-        rangeSlider(dl, LVC_MINDELAY, LVC_MAXDELAY, "TIME", ImVec2(x0, y), w, false, on);
-        y += 50.f * s;
-        if (tuned)
-        {
-            // the notes the comb can ring at: the delay range read as pitches (long delay = low note)
-            char lo[16], hi[16], buf[48];
-            const float t0 = std::min(pv[LVC_MINDELAY], pv[LVC_MAXDELAY]), t1 = std::max(pv[LVC_MINDELAY], pv[LVC_MAXDELAY]);
-            noteName(tunedNote(t1 * 0.001), lo, sizeof(lo));
-            noteName(tunedNote(t0 * 0.001), hi, sizeof(hi));
-            if (std::strcmp(lo, hi) == 0)
-                std::snprintf(buf, sizeof(buf), "%s", lo);
-            else
-                std::snprintf(buf, sizeof(buf), "%s \xe2\x80\x93 %s", lo, hi);
-            textCentered(dl, fSmall, ImVec2((x0 + x1) * 0.5f, y - 8.f * s), U32(P.c, on ? 0.95f : 0.5f), buf);
-        }
-        rangeSlider(dl, LVC_MINFEEDBACK, LVC_FEEDBACK, "FEEDBACK", ImVec2(x0, y), w, false, on);
-        y += 38.f * s;
-        rangeSlider(dl, LVC_MINDLYMIX, LVC_DLYMIX, sendRoute ? "SEND" : "DRY / WET", ImVec2(x0, y), w, false, on);
+        rangeKnob(dl, LVC_MINDELAY, LVC_MAXDELAY, "TIME", ImVec2(x0, y), w, false, on);
+        y += 64.f * s;
+        rangeKnob(dl, LVC_MINFEEDBACK, LVC_FEEDBACK, "FEEDBACK", ImVec2(x0, y), w, false, on);
+        y += 64.f * s;
+        rangeKnob(dl, LVC_MINDLYMIX, LVC_DLYMIX, sendRoute ? "SEND" : "DRY / WET", ImVec2(x0, y), w, false, on);
     }
 
     // ---- antialiased band: filled strip (per-vertex colour) between two contours ----
@@ -5831,20 +6264,22 @@ protected:
         segmented(dl, LVC_RVMODE, rvModes, 2, ImVec2(x0, y + 14.f * s), ImVec2(x1, y + 38.f * s), on);
         y += 42.f * s;
 
-        // chance that a slice is thrown into the reverb
-        const float rc = 20.f * s;
-        knob(dl, LVC_RVCHANCE, "CHANCE", ImVec2(x0 + w * 0.5f, y + rc), rc, on, false, w);
-        y += rc * 2.f + 40.f * s;
+        // the two per-slice ranges sit side by side; the tooltip has their exact bounds
+        const float cw2 = w * 0.5f, rr = 14.f * s;
+        rangeKnob(dl, LVC_RVSENDMIN, LVC_RVSENDMAX, "SEND", ImVec2(x0, y), cw2, false, on, rr, true);
+        rangeKnob(dl, LVC_RVDECAYMIN, LVC_RVDECAYMAX, "DECAY", ImVec2(x0 + cw2, y), cw2, false, on, rr, true);
+        y += rr * 2.f + 13.f * s + fs(fSmall) * 1.7f + 10.f * s;
 
-        rangeSlider(dl, LVC_RVSENDMIN, LVC_RVSENDMAX, "SEND", ImVec2(x0, y), w, false, on);
-        y += 46.f * s;
-        rangeSlider(dl, LVC_RVDECAYMIN, LVC_RVDECAYMAX, "DECAY", ImVec2(x0, y), w, false, on);
-        y += 50.f * s;
-
-        const float r = 16.f * s;
-        const float ky = std::min(y + r, b.y - 14.f * s - r - 30.f * s);
-        knob(dl, LVC_RVSIZE, "SIZE", ImVec2(x0 + w * 0.25f, ky), r, on, false, w * 0.5f);
-        knob(dl, LVC_RVDAMP, "DAMP", ImVec2(x0 + w * 0.75f, ky), r, on, false, w * 0.5f);
+        // fill the rest with the chance knob and the tail-shaping pair
+        const float gridTop = y, gridBot = b.y - 12.f * s;
+        const float rowH = (gridBot - gridTop) * 0.5f;
+        const float rc = std::max(18.f * s, std::min(w * 0.28f, rowH * 0.5f - 22.f * s));
+        knob(dl, LVC_RVCHANCE, "CHANCE", ImVec2(x0 + w * 0.5f,
+             gridTop + (rowH - 2.f * rc - 32.f * s) * 0.5f + rc), rc, on, false, w);
+        const float r2 = std::max(14.f * s, std::min(cw2 * 0.5f - 8.f * s, rowH * 0.5f - 22.f * s));
+        const float cy2 = gridTop + rowH + (rowH - 2.f * r2 - 32.f * s) * 0.5f + r2;
+        knob(dl, LVC_RVSIZE, "SIZE", ImVec2(x0 + cw2 * 0.5f, cy2), r2, on, false, cw2);
+        knob(dl, LVC_RVDAMP, "DAMP", ImVec2(x0 + cw2 * 1.5f, cy2), r2, on, false, cw2);
     }
 
     void drawMasterPanel(ImDrawList* dl, ImVec2 a, ImVec2 b)
@@ -5995,7 +6430,7 @@ protected:
             const ImVec4 base = black ? (P.dark ? hex(0x1B1E2A) : hex(0x30343F)) : (P.dark ? hex(0xD6DAE4) : hex(0xFFFFFF));
             const ImDrawFlags rf = ImDrawFlags_RoundCornersBottom;
             if (isRoot)
-                gradRect(dl, ka, kb, withA(P.a, alpha), withA(P.b, alpha), rr, false, rf);
+                gradRectTheme(dl, ka, kb, rr, alpha, false, rf);
             else
                 dl->AddRectFilled(ka, kb, U32(base, alpha), rr, rf);
             // out-of-key notes are shaded so the scale reads at a glance
@@ -6354,8 +6789,8 @@ protected:
         drawScaleSelector(dl, ImVec2(x0, y), ImVec2(x1, y + 22.f * s), keyLive);
         y += 22.f * s + 9.f * s;
 
-        rangeSlider(dl, LVC_CHLOW, LVC_CHHIGH, "REGION", ImVec2(x0, y), w, false, on);
-        y += 42.f * s;
+        spectrumRangeSlider(dl, LVC_CHLOW, LVC_CHHIGH, "REGION", ImVec2(x0, y), w, on);
+        y += 64.f * s;
 
         // tone
         const float cw4 = w / 4.f, r = 14.f * s;

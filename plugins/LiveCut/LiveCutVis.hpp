@@ -115,7 +115,7 @@ struct State {
     float   scopeHP[kScopeColumns] {};          // per-slice highpass cutoff (Hz), for the panel's response curve
     float   scopeVerb[kScopeColumns] {};        // reverb send level (0..1)
 
-    // ---- currently selected value for every min/max slider, indexed by its lower parameter ID ----
+    // ---- currently selected value for every min/max range knob, indexed by its lower parameter ID ----
     float   paramCurrent[kMaxParams] {};
     uint8_t paramCurrentValid[kMaxParams] {};
 

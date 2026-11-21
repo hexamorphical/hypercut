@@ -196,7 +196,7 @@ public:
         ++blockCounter;
     }
 
-    // Publish the value currently selected for every min/max slider, so the UI can mark it on the track.
+    // Publish the value currently selected for every min/max range knob, so the UI can rotate its pointer.
     void visPublishCurrentValues()
     {
         auto put = [&](int idx, float value) {
@@ -394,6 +394,17 @@ protected:
             break;
         case LVC_RESO:
             parameter.name = "Filter Resonance"; parameter.symbol = "livecut_reso";
+            break;
+        case LVC_FILTERDRIVE:
+            parameter.name = "Filter Drive"; parameter.symbol = "livecut_filterdrive";
+            break;
+        case LVC_CRUSHMIX:
+            parameter.name = "Crusher Dry/Wet"; parameter.symbol = "livecut_crushmix";
+            break;
+        case LVC_CRUSHLP:
+            parameter.name = "Crusher Post Lowpass"; parameter.symbol = "livecut_crushlp";
+            parameter.unit = "Hz";
+            parameter.hints |= kParameterIsLogarithmic;
             break;
         case LVC_MIX:
             parameter.name = "Dry/Wet"; parameter.symbol = "livecut_mix";
@@ -860,6 +871,8 @@ protected:
         highpass.setSampleRate(sampleRate);
         lowpass.reset();
         highpass.reset();
+        crushLowpass.setSampleRate(sampleRate);
+        crushLowpass.reset();
         masterLowpass.setSampleRate(sampleRate);
         echo.SetSampleRate(sampleRate); // allocates the delay buffers
         dlyWetSmooth = 0.f;
@@ -895,6 +908,12 @@ protected:
         lpSmooth = lpTarget = std::log(sliceFilter.Lowpass());
         hpSmooth = hpTarget = std::log(sliceFilter.Highpass());
         filterMix = control[LVC_FILTER] > 0.5f ? 1.f : 0.f;
+        filterDriveSmooth = 1.f + 8.f * control[LVC_FILTERDRIVE];
+        filterDriveNorm = filterDriveSmooth > 1.001f ? 1.f / std::tanh(filterDriveSmooth) : 1.f;
+        crushMixSmooth = control[LVC_CRUSHMIX];
+        crushOnSmooth = control[LVC_CRUSHER] > 0.5f ? 1.f : 0.f;
+        crushLpSmooth = std::log(control[LVC_CRUSHLP]);
+        crushLpAmount = 0.f;
         mLpSmooth = std::log(control[LVC_MASTERLPFREQ]);
         mHpSmooth = std::log(control[LVC_MASTERHPFREQ]);
         reverb.setSize(control[LVC_RVSIZE], true);
@@ -1199,7 +1218,12 @@ protected:
         const float mHpOpenLog = std::log(20.0f),    mHpFadeLog = std::log(24.0f);
 
         const float reso      = control[LVC_RESO];
+        const float driveTarget = 1.f + 8.f * control[LVC_FILTERDRIVE];
         const float filterTarget = control[LVC_FILTER] > 0.5f ? 1.f : 0.f;
+        const float crushMixTarget = control[LVC_CRUSHMIX];
+        const float crushOnTarget = control[LVC_CRUSHER] > 0.5f ? 1.f : 0.f;
+        const float crushLpTarget = std::log(control[LVC_CRUSHLP]);
+        const float crushLpOpenLog = std::log(20000.0f), crushLpFadeLog = std::log(17000.0f);
         const float revTarget = control[LVC_REVERB] > 0.5f ? 1.f : 0.f;
         const float lpOff = std::log(19000.0f), lpMaxLog = std::log(20000.0f);
         const float hpOff = std::log(25.0f),    hpMinLog = std::log(20.0f);
@@ -1263,6 +1287,10 @@ protected:
             // ---- smoothed settings ----
             mixSmooth += smoothCoef * (mixTarget - mixSmooth);
             filterMix += smoothCoef * (filterTarget - filterMix);
+            filterDriveSmooth += smoothCoef * (driveTarget - filterDriveSmooth);
+            crushMixSmooth += smoothCoef * (crushMixTarget - crushMixSmooth);
+            crushOnSmooth += smoothCoef * (crushOnTarget - crushOnSmooth);
+            crushLpSmooth += cutoffCoef * (crushLpTarget - crushLpSmooth);
             mLpSmooth += smoothCoef * (mLpTarget - mLpSmooth);
             mHpSmooth += smoothCoef * (mHpTarget - mHpSmooth);
             // per-slice cutoffs (picked by SliceFilter at each block / cut), lightly smoothed against zipper noise
@@ -1279,6 +1307,10 @@ protected:
                 // fade filters fully out when parked at their extremes, so they are transparent by default
                 lpAmount = limit<float>((lpMaxLog - lpSmooth) / (lpMaxLog - lpOff), 0.f, 1.f);
                 hpAmount = limit<float>((hpSmooth - hpMinLog) / (hpOff - hpMinLog), 0.f, 1.f);
+                filterDriveNorm = filterDriveSmooth > 1.001f ? 1.f / std::tanh(filterDriveSmooth) : 1.f;
+                const float nyq = 0.45f * static_cast<float>(sampleRate);
+                crushLowpass.set(std::min(nyq, std::exp(crushLpSmooth)), 0.f);
+                crushLpAmount = limit<float>((crushLpOpenLog - crushLpSmooth) / (crushLpOpenLog - crushLpFadeLog), 0.f, 1.f);
                 masterLowpass.set(std::exp(mLpSmooth), 0.f);  // flat response (Butterworth)
                 masterHighpass.set(std::exp(mHpSmooth), 0.f);
             }
@@ -1340,8 +1372,19 @@ protected:
                     break;
                 }
                 case kFxCrusher:
-                    crusher.tick(l, r, l, r);
+                {
+                    float cl = l, cr = r;
+                    crusher.tick(cl, cr, l, r);
+                    // post lowpass tames the digital edges of the bit/sample-rate reduction
+                    float fl = cl, fr = cr;
+                    crushLowpass.tick(fl, fr);
+                    cl += crushLpAmount * (fl - cl);
+                    cr += crushLpAmount * (fr - cr);
+                    const float amt = crushMixSmooth * crushOnSmooth;
+                    l += amt * (cl - l);
+                    r += amt * (cr - r);
                     break;
+                }
                 case kFxComb:
                 {
                     if (delayInsert)
@@ -1388,7 +1431,14 @@ protected:
                 }
                 case kFxFilter:
                 {
+                    // saturate the signal going into the filter: the normalisation keeps full-scale peaks
+                    // roughly where they were while low-level material gets the harmonic density of the drive
                     float fl = l, fr = r;
+                    if (filterDriveSmooth > 1.001f)
+                    {
+                        fl = std::tanh(l * filterDriveSmooth) * filterDriveNorm;
+                        fr = std::tanh(r * filterDriveSmooth) * filterDriveNorm;
+                    }
                     lowpass.tick(fl, fr);
                     l += lpAmount * filterMix * (fl - l);
                     r += lpAmount * filterMix * (fr - r);
@@ -1766,6 +1816,9 @@ private:
     // Livecut components
     LivePlayer player;
     BitCrusher crusher;
+    SVFilter crushLowpass{SVFilter::kLowpass};
+    float crushMixSmooth = 1.f, crushOnSmooth = 0.f;
+    float crushLpSmooth = 0.f, crushLpAmount = 0.f;
     Comb comb;
     BBCutter bbcutter;
     VisListener visListener;
@@ -1788,6 +1841,7 @@ private:
     float transOnSmooth = 0.f, transGainPeak = 0.f;
     float lpAmount = 0.f, hpAmount = 0.f;
     float filterMix = 1.f;
+    float filterDriveSmooth = 1.f, filterDriveNorm = 1.f;
     float lpTarget = 0.f, hpTarget = 0.f, lastLpHz = -1.f, lastHpHz = -1.f;
     float cutoffCoef = 0.01f;
     SliceFilter sliceFilter;

@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2.3
+
+- **Circular min/max knobs.** Every per-slice min/max range is now a rotary knob with a Serum-style modulation arc:
+  drag either end of the arc to set the bounds, and watch the pointer rotate to the value of the slice playing now.
+  The exact numbers remain available in a tooltip. Labels and readouts sit centred below each knob, like all other knobs.
+  Related ranges are now grouped into compact rows, and the remaining knobs scale to fill each panel without gaps.
+- **Live knob rotation.** Parameters that move on their own while audio plays — per-slice random values and the trance
+  gate's envelope depths — now rotate their pointers instead of only changing a ring or a marker.
+- **Horizontal region slider.** The pitchmap's frequency region returns to a log-frequency horizontal slider with two
+  draggable edges, a live marker and exact values in a tooltip. It lines up with the analyser's spectrum axis.
+- **Filter drive.** A saturation control next to RESONANCE overdrives the signal entering the per-slice filter; the
+  default is clean so existing sessions sound unchanged. The crush visualiser now shows one waveform cycle.
+- **Crusher mix and post lowpass.** The CRUSH panel now has a dry/wet **MIX** control and a **POST LP** filter after the
+  bit/sample-rate reduction. Both default to transparent so existing sessions sound unchanged.
+- **Animated segmented selectors.** The trance gate's RATE selector now uses the same segmented design as SUBDIVISION,
+  and the selected highlight slides smoothly to the new value when clicked.
+- **Unified theme gradients.** Toggles, knob arcs, range bands, segmented selectors, spectrum sliders and the trance
+  gate envelope fill and automation line all use the same full six-stop sweep as the website, in every skin and in both
+  light and dark mode, instead of each widget using its own short two-colour blend. Labelled toggle and selector fills
+  are softened so the text stays readable, with no outer glow or inset shadow.
+- **Gate envelope playhead.** The gate automation line is now the coloured part of the step, with a gradient bloom and a
+  25% fill beneath it; the area above the curve is transparent over a pure black/white inset. Steps without attack or
+  decay keep their square-wave top edge visible. The playhead is shown only as a stronger glowing dot on the envelope
+  curve, with no selected-cell outline, rectangular glow, or full line across the steps.
+
 ## v0.2.2
 
 - **Delay INSERT / SEND routing.** A new switch in the DELAY panel: INSERT keeps the delay in the slice path and the

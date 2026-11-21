@@ -18,6 +18,7 @@
 #define __GLIBC_USE_C23_STRTOL 0
 __asm__(".symver log10f,log10f@GLIBC_2.2.5");
 __asm__(".symver acosf,acosf@GLIBC_2.2.5");
+__asm__(".symver atan2f,atan2f@GLIBC_2.2.5");
 #endif
 #endif
 

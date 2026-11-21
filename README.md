@@ -142,8 +142,8 @@ The gate never rearranges anything: the audio plays in place and steps are only 
   - Shift-drag morphs the curve tension continuously, from logarithmic through linear to exponential, like DAW
     automation curves.
 - **The envelope modulates more than volume**: **VOLUME**, **LOWPASS** and **HIGHPASS** depth knobs let each step's
-  envelope open and close a filter as well as the level. Each knob shows its modulation range as a glowing band and
-  the live value as a moving ring.
+  envelope open and close a filter as well as the level. Each knob shows its modulation range as a glowing band, a
+  moving ring and a pointer that rotates with the live value.
 
 ### Effects
 
@@ -159,8 +159,10 @@ for every slice, inside min/max ranges you set.
   - **Pitch** shifts the region in semitones, **Tune** moves the note grid in cents, **Gain** sets its level.
   - Spectral **Morph** and **Gate** shorten the ringing.
   - It runs on a phase vocoder; its latency is reported to the host.
-- **Filter** — per-slice 12 dB/oct lowpass and highpass with resonance. Every block glides between random cutoffs.
-- **Crush** — per-slice bit depth and sample-rate reduction.
+- **Filter** — per-slice 12 dB/oct lowpass and highpass with resonance and input **drive** (saturation). Every block
+  glides between random cutoffs.
+- **Crush** — per-slice bit depth and sample-rate reduction, with **MIX** (dry/wet) and a **POST LP** filter to tame
+  the digital edges.
 - **Delay**, in two modes, both with **TUNE**:
   - **COMB** — the original per-slice comb (feed-forward or feedback).
   - **ECHO** — a stereo echo with long times:
@@ -219,7 +221,9 @@ Effects in front of SLICE process what the slicer records; the ones after it pro
 - **Undo / redo** (Ctrl+Z / Ctrl+Shift+Z) for every edit, preset load and dice roll.
 - **Dice**: the big die randomizes the whole patch within musical ranges; each panel's small die randomizes just that
   panel.
-- **Range sliders** for every min/max pair, and knobs with Shift for fine control, the wheel, and double-click to reset.
+- **Circular min/max knobs** for every range: the outer arc is the modulation range, its two ends are dragged to set
+  the bounds, and the pointer rotates to the value picked for the slice playing now. Shift or the wheel fine-tunes,
+  double-click resets. A tooltip shows the exact numbers.
 - **Resizable**: the layout scales and the fonts are re-rendered sharply at any size.
 - Your theme, language and window size are saved per user in `~/.config/HyperCut/ui.conf`
   (`%APPDATA%\HyperCut` on Windows, `~/Library/Preferences/HyperCut` on macOS).
@@ -298,8 +302,8 @@ bash scripts/package-appimage.sh <tag>     # Linux, downloads appimagetool
 bash scripts/package-macos.sh <tag>        # macOS, uses pkgbuild / productbuild / hdiutil
 ```
 
-Output goes into `dist/`. `scripts/pkg-version.sh` reduces a tag such as `v0.2.2-delay-route` to the numeric version
-`0.2.2` used by the installers.
+Output goes into `dist/`. `scripts/pkg-version.sh` reduces a tag such as `v0.2.3-delay-route` to the numeric version
+`0.2.3` used by the installers.
 
 ## License
 
