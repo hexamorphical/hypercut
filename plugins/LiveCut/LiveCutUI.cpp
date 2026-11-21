@@ -44,12 +44,14 @@
 #endif
 
 #include "DistrhoUI.hpp"
+#include "DistrhoPluginInfo.h"
 #include "LiveCutControls.hpp"
 #include "LiveCutLang.hpp"
 #include "LiveCutVis.hpp"
 #include "GateEnvelope.h"
 #include "BlockKinds.h"
 #include "NotoSansFonts.hpp"
+#include "SpaceGroteskFont.hpp"
 
 #include "DearImGui/imgui_internal.h"
 #if defined(DGL_USE_GLES2) || defined(DGL_USE_GLES3) || defined(DGL_USE_OPENGL3)
@@ -99,10 +101,20 @@ static const ImVec4 kLogoRainbow[6] = {
     hex(0x4B98C5), // blue
     hex(0xB85EBA), // violet
 };
+static constexpr int kLogoRainbowCount = static_cast<int>(sizeof(kLogoRainbow) / sizeof(kLogoRainbow[0]));
 
 static inline ImU32 U32(const ImVec4& c, float alphaMul = 1.f)
 {
     return ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, c.w * alphaMul));
+}
+
+// Samples the website's six-stop --rainbow at t in [0, 1], so the wordmark gets the
+// same full sweep as the hero text instead of stopping after five flat colours.
+static inline ImVec4 logoGradientAt(float t)
+{
+    t = std::max(0.f, std::min(1.f, t)) * (kLogoRainbowCount - 1);
+    const int i = std::min(kLogoRainbowCount - 2, static_cast<int>(t));
+    return mix(kLogoRainbow[i], kLogoRainbow[i + 1], t - static_cast<float>(i));
 }
 
 // --------------------------------------------------------------------------------------------------------------------
@@ -776,7 +788,7 @@ class HyperCutUI : public UI
     ImFont* fBody = nullptr;
     ImFont* fSmall = nullptr;
     ImFont* fBold = nullptr;
-    ImFont* fTitle = nullptr;
+    ImFont* fLogo = nullptr;
     float fontBuiltScale = 1.f;
     float fontAdj = 1.f;
     bool fontRebuildPending = false;
@@ -1813,7 +1825,7 @@ protected:
         fBody  = add(NotoSansMedium_data, NotoSansMedium_size, 13.5f);
         fSmall = add(NotoSansMedium_data, NotoSansMedium_size, 11.f);
         fBold  = add(NotoSansBold_data,   NotoSansBold_size,   12.f);
-        fTitle = add(NotoSansBold_data,   NotoSansBold_size,   24.f);
+        fLogo  = add(SpaceGroteskBold_data, SpaceGroteskBold_size, 24.f);
         io.Fonts->Build();
         io.FontDefault = fBody;
 
@@ -1907,25 +1919,30 @@ protected:
         text(dl, f, ImVec2(center.x - sz.x * 0.5f, center.y - sz.y * 0.5f), col, t);
     }
 
-    // Wordmark: "HYPER" takes the six-stripe palette (one colour per letter), "CUT" follows the theme
-    void logoText(ImDrawList* dl, ImFont* f, ImVec2 pos, ImU32 cutCol) const
+    // Wordmark: the website's "hyperCut" camel-case lockup, set in Space Grotesk.
+    // "hyper" carries the full six-stop hero gradient; "Cut" follows the theme text colour.
+    float logoText(ImDrawList* dl, ImFont* f, ImVec2 pos, ImU32 cutCol) const
     {
-        static const char hyper[6] = "HYPER";
-        static const char cut[4]   = "CUT";
+        static const char hyper[6] = "hyper";
+        static const char cut[4]   = "Cut";
         const float size = fs(f), scale = size / f->FontSize;
+        const float tracking = -0.055f * size; // the website's -.055em hero tracking
         float x = pos.x;
-        for (int i = 0; i < 5; ++i)
-        {
-            char ch[2] = { hyper[i], '\0' };
-            dl->AddText(f, size, ImVec2(x, pos.y), U32(kLogoRainbow[i]), ch);
-            x += f->GetCharAdvance(static_cast<ImWchar>(static_cast<unsigned char>(hyper[i]))) * scale;
-        }
-        for (int i = 0; i < 3; ++i)
-        {
-            char ch[2] = { cut[i], '\0' };
-            dl->AddText(f, size, ImVec2(x, pos.y), cutCol, ch);
-            x += f->GetCharAdvance(static_cast<ImWchar>(static_cast<unsigned char>(cut[i]))) * scale;
-        }
+
+        auto drawRun = [&](const char* text, int count, bool gradient) {
+            for (int i = 0; i < count; ++i)
+            {
+                ImU32 col = cutCol;
+                if (gradient)
+                    col = U32(logoGradientAt((static_cast<float>(i) + 0.5f) / static_cast<float>(count)));
+                char ch[2] = { text[i], '\0' };
+                dl->AddText(f, size, ImVec2(x, pos.y), col, ch);
+                x += f->GetCharAdvance(static_cast<ImWchar>(static_cast<unsigned char>(text[i]))) * scale + tracking;
+            }
+        };
+        drawRun(hyper, 5, true);
+        drawRun(cut, 3, false);
+        return x - pos.x - tracking;
     }
 
     void textRight(ImDrawList* dl, ImFont* f, ImVec2 rightTop, ImU32 col, const char* t)
@@ -3058,7 +3075,7 @@ protected:
         const float top = pad, h = 52.f * s;
         const float cy = top + h * 0.5f;
 
-        // ---- logo: six bars in the "present" rainbow palette; HYPER is coloured, CUT uses the theme ----
+        // ---- logo: six bars in the "present" rainbow palette; "hyper" is coloured, "Cut" uses the theme ----
         {
             const float x = pad + 4.f * s;
             const float bw = 4.f * s, gap = 3.f * s;
@@ -3084,10 +3101,13 @@ protected:
             }
 
             const float tx = x + 6 * (bw + gap) + 10.f * s;
-            const float ty = cy - fs(fTitle) * 0.5f - 6.f * s;
-            logoText(dl, fTitle, ImVec2(tx, ty), U32(P.text));
-            const ImVec2 tsz = textSize(fTitle, "HYPERCUT");
-            text(dl, fSmall, ImVec2(tx + 1.f * s, ty + tsz.y - 2.f * s), U32(P.textDim), "BEAT SLICER  \xc2\xb7  v2");
+            const float ty = cy - fs(fLogo) * 0.5f - 6.f * s;
+            const float logoW = logoText(dl, fLogo, ImVec2(tx, ty), U32(P.text));
+
+            static const char subtitle[] = "BEAT SLICER  \xc2\xb7  v" HYPERCUT_DISPLAY_VERSION;
+            const ImVec2 subSz = fSmall->CalcTextSizeA(fs(fSmall), FLT_MAX, 0.f, subtitle);
+            text(dl, fSmall, ImVec2(tx + (logoW - subSz.x) * 0.5f, ty + fs(fLogo) - 3.f * s),
+                 U32(P.textDim), subtitle);
             drawLogoSparks(dl);
         }
 

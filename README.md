@@ -333,5 +333,7 @@ HyperCut, to be distributed under version 3. The libraries it uses keep their ow
 - **[Dear ImGui](https://github.com/ocornut/imgui)**, MIT license.
 - **[Noto Sans](https://fonts.google.com/noto/specimen/Noto+Sans)** by the Noto Project Authors (embedded as a Latin
   subset), [SIL Open Font License](https://openfontlicense.org).
+- **[Space Grotesk](https://fonts.google.com/specimen/Space+Grotesk)** by the Space Grotesk Project Authors (embedded
+  as a Latin subset for the header wordmark), [SIL Open Font License](https://openfontlicense.org).
 - State-variable filter based on the work of Andrew Simper ([Cytomic](https://cytomic.com/technical-papers/)).
 - The spectral pitchmap was inspired by Xynth Audio's Chroma.

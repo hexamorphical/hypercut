@@ -24,6 +24,8 @@
   25% fill beneath it; the area above the curve is transparent over a pure black/white inset. Steps without attack or
   decay keep their square-wave top edge visible. The playhead is shown only as a stronger glowing dot on the envelope
   curve, with no selected-cell outline, rectangular glow, or full line across the steps.
+- **Brand-consistent header logo.** The wordmark now reads **hyperCut** in the website's Space Grotesk Bold, with the
+  full six-stop gradient across "hyper" and the release version (`v0.2.3`) shown underneath.
 
 ## v0.2.2
 
