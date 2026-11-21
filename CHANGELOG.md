@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.4
+
+- **Pitchmap key presets.** The spectral pitchmap now uses three dropdowns — **KEY**, **SCALE** (Major, Melodic Minor,
+  Pentatonic, Custom) and **MODE**. Major offers Ionian through Locrian. Melodic Minor offers Melodic Minor, Dorian #2,
+  Lydian Augmented, Lydian Dominant, Mixo b6, Locrian #2, Altered and Phrygian Dominant. MODE is disabled for
+  Pentatonic and Custom. The piano editor is only shown for Custom scales, where clicking a key adds or removes that
+  note. Existing sessions keep their scale and sound; the new custom-scale parameter is appended.
+
 ## v0.2.3
 
 - **Circular min/max knobs.** Every per-slice min/max range is now a rotary knob with a Serum-style modulation arc:

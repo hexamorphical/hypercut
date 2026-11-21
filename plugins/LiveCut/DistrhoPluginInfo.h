@@ -46,7 +46,7 @@
 
 // Release shown in the UI header. Packaging derives the installer version from the git tag;
 // getVersion() stays at the original LiveCut ABI version for session compatibility.
-#define HYPERCUT_DISPLAY_VERSION "0.2.3"
+#define HYPERCUT_DISPLAY_VERSION "0.2.4"
 
 #define DISTRHO_PLUGIN_IS_RT_SAFE 0
 #define DISTRHO_PLUGIN_NUM_INPUTS 2

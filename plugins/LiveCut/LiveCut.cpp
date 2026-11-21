@@ -533,6 +533,10 @@ protected:
             setEnum(parameter, labels, LVC_NUM_SCALES);
             break;
         }
+        case LVC_CHCUSTOM:
+            // twelve pitch classes of the Custom scale (bit i = LVC_CHKEY + i), edited from the piano keyboard
+            parameter.name = "Pitchmap Custom Scale"; parameter.hints |= kParameterIsInteger;
+            break;
         case LVC_CHCOLOR:   parameter.name = "Pitchmap Color"; break;
         case LVC_CHPITCH:
             parameter.name = "Pitchmap Pitch"; parameter.unit = "st";
@@ -950,7 +954,8 @@ protected:
             midiLatched = 0; // start from the key / scale until notes arrive
         midiModeWas = midi;
         // MIDI mode: the pitch classes of the held notes; after release the last chord stays (latched)
-        const uint16_t mask = (midi && midiLatched != 0) ? midiLatched : lvcScalePitchClasses(scale, key);
+        const uint16_t custom = static_cast<uint16_t>(control[LVC_CHCUSTOM]) & 0x0FFF;
+        const uint16_t mask = (midi && midiLatched != 0) ? midiLatched : lvcScalePitchClasses(scale, key, custom);
         chroma.setPitchClasses(mask);
         chroma.setColor(control[LVC_CHCOLOR]);
         chroma.setPitch(std::round(control[LVC_CHPITCH]));

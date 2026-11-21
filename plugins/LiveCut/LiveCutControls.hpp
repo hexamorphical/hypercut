@@ -189,7 +189,9 @@ enum LiveCutControls{
     LVC_FILTERDRIVE   = 145, // filter input saturation, 0 = clean
     LVC_CRUSHMIX      = 146, // crusher dry / wet (1 = fully crushed)
     LVC_CRUSHLP       = 147, // crusher post lowpass, Hz (20000 = bypassed)
-    LVC_CONTROL_NR    = 148
+    // Appended so existing sessions keep their parameter ids. Bit i = the note i semitones above LVC_CHKEY.
+    LVC_CHCUSTOM      = 148, // custom pitch classes of the pitchmap scale (used when LVC_CHSCALE = Custom)
+    LVC_CONTROL_NR    = 149
 };
 
 static const std::array<std::pair<float, float>, LVC_CONTROL_NR> controlLimits =
@@ -261,7 +263,7 @@ static const std::array<std::pair<float, float>, LVC_CONTROL_NR> controlLimits =
     {0.0f, 1.0f},        // LVC_CHROMA
     {0.0f, 5.0f},        // LVC_CHPOS
     {0.0f, 11.0f},       // LVC_CHKEY
-    {0.0f, 23.0f},       // LVC_CHSCALE (LVC_NUM_SCALES - 1)
+    {0.0f, 30.0f},       // LVC_CHSCALE (LVC_NUM_SCALES - 1)
     {0.0f, 2.0f},        // LVC_CHCOLOR
     {-24.0f, 24.0f},     // LVC_CHPITCH (semitones)
     {-50.0f, 50.0f},     // LVC_CHTUNE (cents)
@@ -341,7 +343,8 @@ static const std::array<std::pair<float, float>, LVC_CONTROL_NR> controlLimits =
     {0.0f, 1.0f},        // LVC_DLYROUTE
     {0.0f, 1.0f},        // LVC_FILTERDRIVE
     {0.0f, 1.0f},        // LVC_CRUSHMIX
-    {20.0f, 20000.0f}    // LVC_CRUSHLP
+    {20.0f, 20000.0f},   // LVC_CRUSHLP
+    {0.0f, 4095.0f}      // LVC_CHCUSTOM (12 pitch classes)
 }};
 
 static const float LVC_DEFAULTS[LVC_CONTROL_NR] = {
@@ -493,6 +496,7 @@ static const float LVC_DEFAULTS[LVC_CONTROL_NR] = {
     0.0f,     // LVC_FILTERDRIVE (clean: old sessions sound the same)
     1.0f,     // LVC_CRUSHMIX (fully wet: old sessions sound the same)
     20000.0f, // LVC_CRUSHLP (open: old sessions sound the same)
+    2741.0f,  // LVC_CHCUSTOM (C major: 0x0AB5, used when Custom is selected)
 };
 
 // Parameter symbols (stable identifiers used by hosts, sessions and preset files). Never reorder or rename.
@@ -645,6 +649,7 @@ static const char* const LVC_SYMBOLS[LVC_CONTROL_NR] = {
     "livecut_filterdrive",
     "livecut_crushmix",
     "livecut_crushlp",
+    "livecut_chcustom",
 };
 
 // Chroma scales: bit i set = the note i semitones above the root belongs to the scale.
@@ -681,18 +686,101 @@ static const LvcScale LVC_SCALES[] = {
     { "Fifths",            lvcMask({0, 7}),                 -1,  0 },
     { "Root Only",         lvcMask({0}),                    -1,  0 },
     { "Chromatic",         0x0FFF,                          -1,  0 },
+    // Modes of melodic minor (appended: old sessions keep their indices)
+    { "Dorian #2",         lvcMask({0, 1, 3, 5, 7, 9, 10}), -1,  0 }, // 24
+    { "Lydian Augmented",  lvcMask({0, 2, 4, 6, 8, 9, 11}), -1,  0 }, // 25
+    { "Lydian Dominant",   lvcMask({0, 2, 4, 6, 7, 9, 10}), -1,  0 }, // 26
+    { "Mixo b6",           lvcMask({0, 2, 4, 5, 7, 8, 10}), -1,  0 }, // 27
+    { "Locrian #2",        lvcMask({0, 2, 3, 5, 6, 8, 10}), -1,  0 }, // 28
+    { "Altered",           lvcMask({0, 1, 3, 4, 6, 8, 10}), -1,  0 }, // 29
+    { "Custom",            0,                               -1,  0 }, // 30: mask comes from LVC_CHCUSTOM
 };
 static constexpr int LVC_NUM_SCALES = static_cast<int>(sizeof(LVC_SCALES) / sizeof(LVC_SCALES[0]));
-static_assert(LVC_NUM_SCALES == 24, "LVC_CHSCALE range must match the scale table");
+static constexpr int kLvcCustomScale = 30;
+static_assert(LVC_NUM_SCALES == 31, "LVC_CHSCALE range must match the scale table");
+static_assert(kLvcCustomScale == LVC_NUM_SCALES - 1, "Custom must be the last scale");
 
 static const char* const LVC_KEY_NAMES[12] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
 
-// absolute pitch classes (bit 0 = C) of a scale on a root
-static inline uint16_t lvcScalePitchClasses(int scale, int root)
+// The pitchmap's three preset dropdowns. LVC_CHSCALE stays the single source of truth, so sessions saved before
+// the dropdowns existed keep selecting exactly the same scale. The mode groups below map the new UI onto those
+// indices; scales from older sessions that are not part of a group are shown as Custom (their sound is unchanged).
+enum LvcScaleFamily { kLvcMajor = 0, kLvcMelodicMinor, kLvcPentatonic, kLvcCustomFamily, kLvcFamilyCount };
+
+static const char* const LVC_FAMILY_NAMES[kLvcFamilyCount] = { "Major", "Melodic Minor", "Pentatonic", "Custom" };
+
+static const char* const LVC_MAJOR_MODES[] = { "Ionian", "Dorian", "Phrygian", "Lydian", "Mixolydian", "Aeolian", "Locrian" };
+static const int LVC_MAJOR_MODE_SCALES[]   = { 0, 4, 5, 6, 7, 1, 8 };
+
+static const char* const LVC_MM_MODES[] = { "Melodic Minor", "Dorian #2", "Lydian Augmented", "Lydian Dominant",
+                                            "Mixo b6", "Locrian #2", "Altered", "Phrygian Dominant" };
+static const int LVC_MM_MODE_SCALES[]   = { 3, 24, 25, 26, 27, 28, 29, 12 };
+
+static const char* const LVC_PENTA_MODES[] = { "Pentatonic", "Minor Pentatonic" };
+static const int LVC_PENTA_MODE_SCALES[]   = { 9, 10 };
+
+static const char* const LVC_CUSTOM_MODES[] = { "Custom" };
+static const int LVC_CUSTOM_MODE_SCALES[]   = { kLvcCustomScale };
+
+struct LvcModeGroup { const char* name; const char* const* modes; const int* scales; int count; };
+static const LvcModeGroup LVC_MODE_GROUPS[kLvcFamilyCount] = {
+    { LVC_FAMILY_NAMES[0], LVC_MAJOR_MODES, LVC_MAJOR_MODE_SCALES,
+      static_cast<int>(sizeof(LVC_MAJOR_MODE_SCALES) / sizeof(LVC_MAJOR_MODE_SCALES[0])) },
+    { LVC_FAMILY_NAMES[1], LVC_MM_MODES, LVC_MM_MODE_SCALES,
+      static_cast<int>(sizeof(LVC_MM_MODE_SCALES) / sizeof(LVC_MM_MODE_SCALES[0])) },
+    { LVC_FAMILY_NAMES[2], LVC_PENTA_MODES, LVC_PENTA_MODE_SCALES,
+      static_cast<int>(sizeof(LVC_PENTA_MODE_SCALES) / sizeof(LVC_PENTA_MODE_SCALES[0])) },
+    { LVC_FAMILY_NAMES[3], LVC_CUSTOM_MODES, LVC_CUSTOM_MODE_SCALES,
+      static_cast<int>(sizeof(LVC_CUSTOM_MODE_SCALES) / sizeof(LVC_CUSTOM_MODE_SCALES[0])) },
+};
+
+static inline int lvcClampScale(int scale)
 {
-    scale = scale < 0 ? 0 : (scale >= LVC_NUM_SCALES ? LVC_NUM_SCALES - 1 : scale);
+    return scale < 0 ? 0 : (scale >= LVC_NUM_SCALES ? LVC_NUM_SCALES - 1 : scale);
+}
+
+static inline int lvcFamilyOfScale(int scale)
+{
+    scale = lvcClampScale(scale);
+    if (scale == kLvcCustomScale) return kLvcCustomFamily;
+    for (int f = 0; f < kLvcFamilyCount - 1; ++f)
+        for (int m = 0; m < LVC_MODE_GROUPS[f].count; ++m)
+            if (LVC_MODE_GROUPS[f].scales[m] == scale) return f;
+    return kLvcCustomFamily; // legacy scale outside the preset groups
+}
+
+static inline int lvcModeOfScale(int scale)
+{
+    const int f = lvcFamilyOfScale(scale);
+    if (f == kLvcCustomFamily) return -1;
+    scale = lvcClampScale(scale);
+    for (int m = 0; m < LVC_MODE_GROUPS[f].count; ++m)
+        if (LVC_MODE_GROUPS[f].scales[m] == scale) return m;
+    return -1;
+}
+
+static inline int lvcScaleForMode(int family, int mode)
+{
+    family = family < 0 ? 0 : (family >= kLvcFamilyCount ? kLvcFamilyCount - 1 : family);
+    const LvcModeGroup& g = LVC_MODE_GROUPS[family];
+    mode = mode < 0 ? 0 : (mode >= g.count ? g.count - 1 : mode);
+    return g.scales[mode];
+}
+
+// Name shown in the MODE field and the pitchmap chip, including legacy custom scales.
+static inline const char* lvcModeLabel(int scale)
+{
+    const int m = lvcModeOfScale(scale);
+    if (m >= 0) return LVC_MODE_GROUPS[lvcFamilyOfScale(scale)].modes[m];
+    return LVC_SCALES[lvcClampScale(scale)].name;
+}
+
+// absolute pitch classes (bit 0 = C) of a scale on a root
+static inline uint16_t lvcScalePitchClasses(int scale, int root, uint16_t customMask = 0)
+{
+    scale = lvcClampScale(scale);
     root = ((root % 12) + 12) % 12;
-    const uint32_t m = LVC_SCALES[scale].mask;
+    const uint32_t m = scale == kLvcCustomScale ? (customMask & 0x0FFF) : LVC_SCALES[scale].mask;
     return static_cast<uint16_t>(((m << root) | (m >> (12 - root))) & 0x0FFF);
 }
 

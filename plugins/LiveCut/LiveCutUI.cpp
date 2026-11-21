@@ -1409,8 +1409,8 @@ protected:
     // key, region and engine stay: they belong to the track, not to the sound
     void randChroma(float* v)
     {
-        static const int scales[] = { 0, 1, 4, 5, 6, 7, 9, 10, 11, 12, 14, 16, 17, 18, 19, 21 };
-        v[LVC_CHSCALE] = static_cast<float>(scales[static_cast<int>(rnd(0.f, 15.999f))]);
+        static const int scales[] = { 0, 1, 4, 5, 6, 7, 9, 10, 11, 12, 14, 16, 17, 18, 19, 21, 24, 25, 26, 27, 28, 29 };
+        v[LVC_CHSCALE] = static_cast<float>(scales[static_cast<int>(rnd(0.f, static_cast<float>(sizeof(scales) / sizeof(scales[0])) - 0.001f))]);
         v[LVC_CHCOLOR] = rnd(0.7f, 1.8f);
         static const float shifts[] = { -12.f, -7.f, -5.f, 5.f, 7.f, 12.f };
         v[LVC_CHPITCH] = chance(0.65f) ? 0.f : shifts[static_cast<int>(rnd(0.f, 5.999f))];
@@ -6384,16 +6384,12 @@ protected:
     {
         if (vis != nullptr)
             return static_cast<uint16_t>(vis->chromaMask.load(std::memory_order_relaxed));
-        return lvcScalePitchClasses(static_cast<int>(pv[LVC_CHSCALE] + 0.5f), static_cast<int>(pv[LVC_CHKEY] + 0.5f));
+        return lvcScalePitchClasses(static_cast<int>(pv[LVC_CHSCALE] + 0.5f), static_cast<int>(pv[LVC_CHKEY] + 0.5f),
+                                    static_cast<uint16_t>(pv[LVC_CHCUSTOM]) & 0x0FFF);
     }
 
-    void setScale(int scale, int key)
-    {
-        setParamGesture(LVC_CHSCALE, static_cast<float>(((scale % LVC_NUM_SCALES) + LVC_NUM_SCALES) % LVC_NUM_SCALES));
-        setParamGesture(LVC_CHKEY, static_cast<float>(((key % 12) + 12) % 12));
-    }
-
-    // one octave keyboard: click a key to set the root; in-key notes lit, held MIDI notes ringed
+    // One octave keyboard. In Custom mode a click toggles that note in the scale (relative to KEY);
+    // in-key notes are lit and held MIDI notes are ringed.
     void drawKeyboard(ImDrawList* dl, ImVec2 a, ImVec2 b, bool on)
     {
         static const int whitePc[7] = { 0, 2, 4, 5, 7, 9, 11 };
@@ -6403,6 +6399,8 @@ protected:
         const uint16_t mask = chromaMask();
         const uint32_t held = vis != nullptr ? vis->chromaHeld.load(std::memory_order_relaxed) : 0u;
         const int key = static_cast<int>(pv[LVC_CHKEY] + 0.5f);
+        const int scaleIdx = static_cast<int>(pv[LVC_CHSCALE] + 0.5f);
+        const bool customEdit = lvcFamilyOfScale(scaleIdx) == kLvcCustomFamily;
         const bool midi = DISTRHO_PLUGIN_WANT_MIDI_INPUT && pv[LVC_CHMIDI] > 0.5f;
         const float alpha = on ? 1.f : 0.55f;
 
@@ -6422,13 +6420,33 @@ protected:
             if (hoverPc < 0)
                 hoverPc = whitePc[std::max(0, std::min(6, static_cast<int>((m.x - a.x) / ww)))];
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            char tip[160];
-            std::snprintf(tip, sizeof(tip), tr("Root: %s (a blue line marks notes the pitchmap is moving sound to)%s"), LVC_KEY_NAMES[hoverPc],
-                          tr(midi ? "  (MIDI mode: held notes choose the notes)" : ""));
+            char tip[192];
+            if (customEdit)
+                std::snprintf(tip, sizeof(tip), tr("Click to %s %s in the custom scale%s"),
+                              tr((mask >> hoverPc) & 1u ? "remove" : "add"), LVC_KEY_NAMES[hoverPc],
+                              tr(midi ? "  (MIDI mode: held notes choose the notes)" : ""));
+            else
+                std::snprintf(tip, sizeof(tip), tr("Root: %s (a blue line marks notes the pitchmap is moving sound to)%s"), LVC_KEY_NAMES[hoverPc],
+                              tr(midi ? "  (MIDI mode: held notes choose the notes)" : ""));
             tooltip("%s", tip);
         }
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && hoverPc >= 0)
-            setParamGesture(LVC_CHKEY, static_cast<float>(hoverPc));
+        {
+            if (customEdit)
+            {
+                // store intervals from KEY, like the built-in scales, so changing KEY transposes the custom scale
+                const uint16_t rel = scaleIdx == kLvcCustomScale
+                                   ? (static_cast<uint16_t>(pv[LVC_CHCUSTOM]) & 0x0FFF)
+                                   : LVC_SCALES[lvcClampScale(scaleIdx)].mask;
+                const int pc = (hoverPc - key + 12) % 12;
+                const uint16_t next = static_cast<uint16_t>(rel ^ (1u << pc));
+                if (scaleIdx != kLvcCustomScale)
+                    setParamGesture(LVC_CHSCALE, static_cast<float>(kLvcCustomScale));
+                setParamGesture(LVC_CHCUSTOM, static_cast<float>(next));
+            }
+            else
+                setParamGesture(LVC_CHKEY, static_cast<float>(hoverPc));
+        }
 
         // where the pitchmap is moving material to right now: a glow along the bottom of the key
         {
@@ -6481,92 +6499,72 @@ protected:
         }
     }
 
-    void drawScalePopup()
+    // Compact dropdown used by the pitchmap's KEY / SCALE / MODE controls.
+    bool dropdown(ImDrawList* dl, const char* id, const char* label, const char* value,
+                  ImVec2 a, ImVec2 b, bool enabled, const char* tip)
     {
+        const float h = b.y - a.y, rr = h * 0.32f, pad = 8.f * s;
+        const float al = enabled ? 1.f : 0.45f;
+        inset(dl, a, b, rr);
+        if (! enabled)
+            dl->AddRectFilled(a, b, U32(P.inset, 0.55f), rr);
+        ImGui::SetCursorScreenPos(a);
+        const bool hit = ImGui::InvisibleButton(id, b - a);
+        const bool hov = enabled && ImGui::IsItemHovered();
+        if (hov)
+        {
+            dl->AddRectFilled(a, b, U32(P.text, 0.07f), rr);
+            dl->AddRect(a, b, U32(withA(P.c, 0.6f)), rr, 0, 1.f);
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (tip != nullptr) tooltip("%s", tip);
+        }
+        text(dl, fSmall, ImVec2(a.x + pad, a.y + (h - fs(fSmall)) * 0.5f), U32(P.textDim, al), label);
+        const float labelEnd = a.x + pad + textSize(fSmall, label).x + 4.f * s;
+        const float chevX = b.x - pad, chevY = a.y + h * 0.5f;
+        dl->AddTriangleFilled(ImVec2(chevX - 3.f * s, chevY - 1.f * s), ImVec2(chevX + 3.f * s, chevY - 1.f * s),
+                              ImVec2(chevX, chevY + 2.5f * s), U32(P.textDim, al));
+        const ImVec2 vs = textSize(fBold, value);
+        dl->PushClipRect(ImVec2(labelEnd, a.y), ImVec2(chevX - 8.f * s, b.y), true);
+        text(dl, fBold, ImVec2(chevX - 8.f * s - vs.x, a.y + (h - fs(fBold)) * 0.5f),
+             U32(enabled ? P.text : P.textDim, al), value);
+        dl->PopClipRect();
+        return hit && enabled;
+    }
+
+    // List behind a dropdown. Returns true and fills selected when an option was clicked.
+    bool dropdownPopup(const char* id, const char* title, const char* const* names, int count, int cur, int& selected)
+    {
+        bool changed = false;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f * s, 8.f * s));
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
-        if (ImGui::BeginPopup("##chscales", ImGuiWindowFlags_NoMove))
+        ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.f * s);
+        if (ImGui::BeginPopup(id, ImGuiWindowFlags_NoMove))
         {
             ImDrawList* pdl = ImGui::GetWindowDrawList();
-            const float cw = 150.f * s, rh = 24.f * s;
-            const int rows = (LVC_NUM_SCALES + 1) / 2;
-            const int cur = static_cast<int>(pv[LVC_CHSCALE] + 0.5f);
-            text(pdl, fSmall, ImGui::GetCursorScreenPos() + ImVec2(8.f * s, 2.f * s), U32(P.textDim), "SCALE");
-            ImGui::Dummy(ImVec2(cw * 2.f, 22.f * s));
-            const ImVec2 o = ImGui::GetCursorScreenPos();
-            for (int i = 0; i < LVC_NUM_SCALES; ++i)
+            const float w = 180.f * s, rh = 24.f * s;
+            text(pdl, fSmall, ImGui::GetCursorScreenPos() + ImVec2(6.f * s, 2.f * s), U32(P.textDim), title);
+            ImGui::Dummy(ImVec2(w, 22.f * s));
+            for (int i = 0; i < count; ++i)
             {
-                const ImVec2 ra(o.x + (i / rows) * cw, o.y + (i % rows) * rh);
-                ImGui::SetCursorScreenPos(ra);
+                const ImVec2 o = ImGui::GetCursorScreenPos();
                 ImGui::PushID(i);
-                const bool clicked = ImGui::InvisibleButton("##sc", ImVec2(cw - 4.f * s, rh));
+                const bool hit = ImGui::InvisibleButton("##opt", ImVec2(w, rh));
                 const bool hov = ImGui::IsItemHovered();
                 ImGui::PopID();
-                if (clicked)
+                if (i == cur || hov)
+                    pdl->AddRectFilled(o, ImVec2(o.x + w, o.y + rh), U32(i == cur ? P.a : P.text, i == cur ? 0.18f : 0.07f), 6.f * s);
+                text(pdl, i == cur ? fBold : fBody, ImVec2(o.x + 8.f * s, o.y + rh * 0.5f - fs(fBody) * 0.5f - 1.f * s),
+                     U32(i == cur || hov ? P.text : P.textDim), names[i]);
+                if (hit)
                 {
-                    setParamGesture(LVC_CHSCALE, static_cast<float>(i));
+                    selected = i;
+                    changed = true;
                     ImGui::CloseCurrentPopup();
                 }
-                const ImVec2 rb(ra.x + cw - 4.f * s, ra.y + rh);
-                if (i == cur)
-                    pdl->AddRectFilled(ra, rb, U32(P.a, 0.16f), 6.f * s);
-                else if (hov)
-                    pdl->AddRectFilled(ra, rb, U32(P.text, 0.06f), 6.f * s);
-                text(pdl, fBody, ImVec2(ra.x + 8.f * s, ra.y + rh * 0.5f - fs(fBody) * 0.5f - 1.f * s),
-                     U32(i == cur || hov ? P.text : P.textDim), LVC_SCALES[i].name);
             }
-            ImGui::SetCursorScreenPos(ImVec2(o.x, o.y + rows * rh));
-            ImGui::Dummy(ImVec2(cw * 2.f, 2.f * s));
             ImGui::EndPopup();
         }
         ImGui::PopStyleVar(2);
-    }
-
-    // [<] scale name [>]: arrows / wheel step through the scales, click opens the list,
-    // shift-click switches to the relative scale (major <-> minor, same notes)
-    void drawScaleSelector(ImDrawList* dl, ImVec2 a, ImVec2 b, bool on)
-    {
-        const int cur = static_cast<int>(pv[LVC_CHSCALE] + 0.5f);
-        const int key = static_cast<int>(pv[LVC_CHKEY] + 0.5f);
-        const float h = b.y - a.y, aw = h;
-        if (pillButton(dl, "##chprev", "<", a, ImVec2(a.x + aw, b.y), false, on))
-            setParamGesture(LVC_CHSCALE, static_cast<float>((cur + LVC_NUM_SCALES - 1) % LVC_NUM_SCALES));
-        if (pillButton(dl, "##chnext", ">", ImVec2(b.x - aw, a.y), b, false, on))
-            setParamGesture(LVC_CHSCALE, static_cast<float>((cur + 1) % LVC_NUM_SCALES));
-
-        const ImVec2 na(a.x + aw + 4.f * s, a.y), nb(b.x - aw - 4.f * s, b.y);
-        ImGui::SetCursorScreenPos(na);
-        const bool clicked = ImGui::InvisibleButton("##chscale", nb - na);
-        const bool hov = ImGui::IsItemHovered();
-        const ImGuiIO& io = ImGui::GetIO();
-        if (clicked)
-        {
-            const LvcScale& sc = LVC_SCALES[cur];
-            if (io.KeyShift && sc.relative >= 0)
-                setScale(sc.relative, key + sc.relShift);
-            else
-                ImGui::OpenPopup("##chscales");
-        }
-        if (hov && io.MouseWheel != 0.f)
-        {
-            wheelEdit = true;
-            setParamGesture(LVC_CHSCALE, static_cast<float>((cur + (io.MouseWheel > 0.f ? LVC_NUM_SCALES - 1 : 1)) % LVC_NUM_SCALES));
-        }
-        inset(dl, na, nb, h * 0.32f);
-        if (hov)
-        {
-            dl->AddRectFilled(na, nb, U32(P.text, 0.05f), h * 0.32f);
-            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            tooltip(LVC_SCALES[cur].relative >= 0 ? "Click: all scales  \xc2\xb7  wheel: step  \xc2\xb7  shift-click: relative scale"
-                                                            : "Click: all scales  \xc2\xb7  wheel: step");
-        }
-        char buf[48];
-        std::snprintf(buf, sizeof(buf), "%s %s", LVC_KEY_NAMES[key], tr(LVC_SCALES[cur].name));
-        dl->PushClipRect(na, nb, true);
-        textCentered(dl, fBold, (na + nb) * 0.5f, U32(on ? P.text : P.textDim), buf);
-        dl->PopClipRect();
-        ImGui::SetNextWindowPos(ImVec2(na.x, nb.y + 4.f * s));
-        drawScalePopup();
+        return changed;
     }
 
     static void noteName(int note, char* buf, size_t sz)
@@ -6583,7 +6581,7 @@ protected:
         const int scale = static_cast<int>(pv[LVC_CHSCALE] + 0.5f);
         {
             char buf[48];
-            std::snprintf(buf, sizeof(buf), "%s %s", LVC_KEY_NAMES[key], tr(LVC_SCALES[scale].name));
+            std::snprintf(buf, sizeof(buf), "%s %s", LVC_KEY_NAMES[key], tr(lvcModeLabel(scale)));
             for (char* c = buf; *c; ++c) *c = static_cast<char>(std::toupper(static_cast<unsigned char>(*c)));
             float x = b.x - 16.f * s;
             chip(dl, ImVec2(x, a.y + 12.f * s), on ? buf : "OFF", on ? P.b : P.textDim, x);
@@ -6802,12 +6800,56 @@ protected:
         }
         y += 26.f * s;
 
-        // root on the keyboard, scale below
-        const float kh = 40.f * s;
-        drawKeyboard(dl, ImVec2(x0, y), ImVec2(x1, y + kh), keyLive);
-        y += kh + 7.f * s;
-        drawScaleSelector(dl, ImVec2(x0, y), ImVec2(x1, y + 22.f * s), keyLive);
-        y += 22.f * s + 9.f * s;
+        // key / scale presets: three dropdowns. The piano editor only appears for Custom scales.
+        const int key = static_cast<int>(pv[LVC_CHKEY] + 0.5f);
+        const int scaleIdx = static_cast<int>(pv[LVC_CHSCALE] + 0.5f);
+        const int family = lvcFamilyOfScale(scaleIdx);
+        const int mode = lvcModeOfScale(scaleIdx);
+        const float ddH = 24.f * s, ddGap = 6.f * s, ddW = (w - ddGap * 2.f) / 3.f;
+        const ImVec2 ka(x0, y), kb(x0 + ddW, y + ddH);
+        const ImVec2 sa(kb.x + ddGap, y), sb(sa.x + ddW, y + ddH);
+        const ImVec2 ma(sb.x + ddGap, y), mb(ma.x + ddW, y + ddH);
+        const bool modeEnabled = family == kLvcMajor || family == kLvcMelodicMinor;
+        const char* modeName = mode >= 0 ? LVC_MODE_GROUPS[family].modes[mode] : lvcModeLabel(scaleIdx);
+        if (dropdown(dl, "##chkeydrop", "KEY", LVC_KEY_NAMES[key], ka, kb, keyLive,
+                     "Root note of the pitchmap scale"))
+            ImGui::OpenPopup("##chkeypopup");
+        if (dropdown(dl, "##chscaledrop", "SCALE", LVC_FAMILY_NAMES[family], sa, sb, keyLive,
+                     "Scale family: Major, Melodic Minor, Pentatonic or Custom"))
+            ImGui::OpenPopup("##chscalepopup");
+        if (dropdown(dl, "##chmodedrop", "MODE", modeName, ma, mb, keyLive && modeEnabled,
+                     modeEnabled ? "Mode of the selected scale family" : "Modes are not available for this scale"))
+            ImGui::OpenPopup("##chmodedpopup");
+        y += ddH + 9.f * s;
+
+        if (family == kLvcCustomFamily)
+        {
+            const float kh = 40.f * s;
+            drawKeyboard(dl, ImVec2(x0, y), ImVec2(x1, y + kh), keyLive);
+            y += kh + 7.f * s;
+        }
+
+        int sel = 0;
+        ImGui::SetNextWindowPos(ImVec2(ka.x, kb.y + 4.f * s));
+        if (dropdownPopup("##chkeypopup", "KEY", LVC_KEY_NAMES, 12, key, sel))
+            setParamGesture(LVC_CHKEY, static_cast<float>(sel));
+        ImGui::SetNextWindowPos(ImVec2(sa.x, sb.y + 4.f * s));
+        if (dropdownPopup("##chscalepopup", "SCALE", LVC_FAMILY_NAMES, kLvcFamilyCount, family, sel))
+        {
+            if (sel == kLvcCustomFamily)
+            {
+                // start the editor from the scale that is currently sounding
+                const uint16_t cur = scaleIdx == kLvcCustomScale
+                                   ? (static_cast<uint16_t>(pv[LVC_CHCUSTOM]) & 0x0FFF)
+                                   : LVC_SCALES[lvcClampScale(scaleIdx)].mask;
+                setParamGesture(LVC_CHCUSTOM, static_cast<float>(cur));
+            }
+            setParamGesture(LVC_CHSCALE, static_cast<float>(lvcScaleForMode(sel, 0)));
+        }
+        ImGui::SetNextWindowPos(ImVec2(ma.x, mb.y + 4.f * s));
+        if (modeEnabled && dropdownPopup("##chmodedpopup", "MODE", LVC_MODE_GROUPS[family].modes,
+                                         LVC_MODE_GROUPS[family].count, mode < 0 ? 0 : mode, sel))
+            setParamGesture(LVC_CHSCALE, static_cast<float>(lvcScaleForMode(family, sel)));
 
         spectrumRangeSlider(dl, LVC_CHLOW, LVC_CHHIGH, "REGION", ImVec2(x0, y), w, on);
         y += 64.f * s;
