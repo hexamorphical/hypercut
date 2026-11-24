@@ -46,6 +46,17 @@ enum ScopeFlags : uint8_t {
     kFlagBypass     = 0x20, // fill mode: outside the fill, output is dry
 };
 
+// One replayed slice inside the frozen two-bar loop. Positions are fractions of the loop buffer.
+struct FreezeRegion {
+    float start;    // slice start
+    float end;      // slice end (including the duty-cycle gap)
+    float dutyEnd;  // end of the audible part
+    int16_t color;  // slice index, used by the UI's block-colour palette
+    float amp;      // slice level, for the phrase map's height
+    float pan;      // slice pan, for the phrase map's pan dot
+    float cents;    // slice pitch, for the phrase map's pitch line
+};
+
 struct Cut {
     float units;   // cut size in units (subdivisions)
     float duty;    // length / size  (0..1)
@@ -80,6 +91,7 @@ struct State {
     // ---- phrase structure (seqlock) ----
     std::atomic<uint32_t> phraseSeq { 0 };
     Phrase phrase {};
+    Phrase prevPhrase {}; // phrase that ended immediately before the current one (two-bar window wrap)
 
     // ---- live playhead info ----
     std::atomic<int32_t>  currentBlock { -1 };  // index into phrase.blocks
@@ -97,6 +109,13 @@ struct State {
     std::atomic<uint32_t> bufferId { 0 };       // increments at every block
     float bufferPeakL[kBufferBins] {};
     float bufferPeakR[kBufferBins] {};
+
+    // ---- freeze: the replayed chops inside the captured loop ----
+    // Published once when freeze is pressed. The UI colours the capture waveform and the
+    // output scope by these regions so every chop stays visible on every lap.
+    static constexpr int kMaxFreezeRegions = 256;
+    std::atomic<int32_t> freezeRegionCount { 0 };
+    FreezeRegion freezeRegions[kMaxFreezeRegions] {};
 
     // ---- scrolling output scope ----
     std::atomic<uint32_t> scopeWrite { 0 };     // monotonically increasing column counter
@@ -131,6 +150,10 @@ struct State {
     // current cut envelope shape (for the capture buffer overlay)
     std::atomic<float> cutAmp      { 1.f };
     std::atomic<float> fadeFrac    { 0.f };  // fade length / cut length
+
+    // freeze: the capture buffer and its chops are being looped instead of re-cut randomly
+    std::atomic<bool>    frozen     { false };
+    std::atomic<int32_t> freezeAnchorUnit { 0 }; // cutter unit at the bar line where the loop was captured
 
     // fill mode
     std::atomic<bool>    fillMode   { false };
@@ -173,7 +196,7 @@ struct State {
     }
 
     // reader helper: returns true if a consistent copy was obtained
-    bool readPhrase(Phrase& out) const noexcept
+    bool readPhrase(Phrase& out, Phrase* prevOut = nullptr) const noexcept
     {
         for (int attempt = 0; attempt < 4; ++attempt)
         {
@@ -182,6 +205,8 @@ struct State {
                 continue;
             std::atomic_thread_fence(std::memory_order_acquire);
             std::memcpy(&out, &phrase, sizeof(Phrase));
+            if (prevOut != nullptr)
+                std::memcpy(prevOut, &prevPhrase, sizeof(Phrase));
             std::atomic_thread_fence(std::memory_order_acquire);
             const uint32_t s2 = phraseSeq.load(std::memory_order_acquire);
             if (s1 == s2)

@@ -50,8 +50,12 @@
 #include "SpectralResonator.h"
 #include "TransientShaper.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <deque>
+#include <vector>
 
 START_NAMESPACE_DISTRHO
 
@@ -74,6 +78,24 @@ class HyperCut : public Plugin
 
 public:
     LiveCutVis::State vis;
+
+    // A chop inside the frozen phrase. The audio is a recording of the final output, so the
+    // region only needs to describe where the chop was, not how to regenerate it.
+    struct FrozenRegion {
+        LiveCutVis::FreezeRegion vis {};
+        float amp = 1.f;
+        float pan = 0.f;
+        float cents = 0.f;
+    };
+
+    // One cut start observed while recording the live output. seq is an absolute output-sample
+    // counter, so regions survive ring wraps and tempo changes.
+    struct FreezeCutEvent {
+        uint64_t seq = 0;
+        size_t audible = 0; // audible length in output samples (cut length / duty cycle)
+        int16_t color = 0;
+        float amp = 1.f, pan = 0.f, cents = 0.f;
+    };
 
     HyperCut()
         // 1 program: keeps the VST3 parameter IDs identical to v1 (see DistrhoPluginInfo.h), 0 states
@@ -114,7 +136,11 @@ public:
 
     void visOnPhrase()
     {
+        if (freezePhraseActive)
+            return; // the freeze loop owns the phrase map until freeze is released
         vis.beginPhraseWrite();
+        // Keep the phrase that just ended: a fixed two-bar window can straddle a phrase boundary.
+        vis.prevPhrase = vis.phrase;
         vis.phrase.totalUnits = static_cast<int32_t>(bbcutter.GetTotalUnits());
         vis.phrase.subdiv     = static_cast<int32_t>(bbcutter.GetSubdiv());
         vis.phrase.numBlocks  = 0;
@@ -128,7 +154,7 @@ public:
     // the logo sparkles: count each audible slice start (muted gate steps and tied continuations don't count)
     void visCountChop(long cut)
     {
-        if (gateSmooth < 0.5f || cut < 0 || cut >= player.GetNumCuts())
+        if (freezePhraseActive || gateSmooth < 0.5f || cut < 0 || cut >= player.GetNumCuts())
             return;
         const CutInfo& ci = player.GetCuts()[cut];
         if (ci.length <= 0 || ci.tiedin || ci.amp < 0.02f)
@@ -141,6 +167,8 @@ public:
     // store whether (and how much) the cut that just started is sent to the reverb
     void visMarkReverb(long cut)
     {
+        if (freezePhraseActive)
+            return; // never repaint the frozen chop map with live reverb sends
         const float send = control[LVC_REVERB] > 0.5f ? reverbSends.Send() : 0.f;
         const int gi = visBlockFirstCut + static_cast<int>(cut);
         if (visBlockIndex < 0 || gi < 0 || gi >= vis.phrase.numCuts)
@@ -154,6 +182,8 @@ public:
 
     void visOnBlock()
     {
+        if (freezePhraseActive)
+            return; // keep the frozen two-bar map instead of a stale host-grid block
         const std::vector<CutInfo>& cuts = player.GetCuts();
         const double spu = bbcutter.SamplesPerUnit();
 
@@ -194,6 +224,240 @@ public:
         vis.endPhraseWrite();
 
         ++blockCounter;
+    }
+
+    // ---- freeze visualisation -----------------------------------------------------------------
+
+    // Publish the recorded chop regions for the capture-buffer and scope colouring. The phrase
+    // map itself is deliberately left alone: it is the cut list the user was watching when they
+    // pressed Freeze, and it must keep showing exactly those slices while the recording loops.
+    // Rebuilding a new map from the recorded events produces a different-looking set of chops
+    // (fewer regions, different groups), which reads as "new slices" in the LIVE CUTS panel.
+    void visBuildFreezeVisuals()
+    {
+        int nr = 0;
+        for (const FrozenRegion& fr : frozenRegions)
+        {
+            if (fr.vis.end <= fr.vis.start)
+                continue;
+            if (nr < LiveCutVis::State::kMaxFreezeRegions)
+            {
+                vis.freezeRegions[nr] = fr.vis;
+                vis.freezeRegions[nr].amp = fr.amp;
+                vis.freezeRegions[nr].pan = fr.pan;
+                vis.freezeRegions[nr].cents = fr.cents;
+            }
+            ++nr;
+        }
+        vis.freezeRegionCount.store(std::min(nr, LiveCutVis::State::kMaxFreezeRegions), std::memory_order_release);
+    }
+
+    // Find the live-phrase block/cut at a unit position. Used only to move the highlight over the
+    // preserved phrase while Freeze replays the recorded audio.
+    void frozenPhrasePos(int unit, int& blockOut, int& cutOut) const
+    {
+        blockOut = -1;
+        cutOut = -1;
+        const LiveCutVis::Phrase& ph = vis.phrase;
+        for (int bi = 0; bi < ph.numBlocks; ++bi)
+        {
+            const LiveCutVis::Block& b = ph.blocks[bi];
+            const int bEnd = b.startUnit + b.units;
+            if (unit < b.startUnit || unit >= bEnd)
+                continue;
+            blockOut = bi;
+            float cu = static_cast<float>(b.startUnit);
+            for (int ci = 0; ci < b.numCuts; ++ci)
+            {
+                const int gi = b.firstCut + ci;
+                if (gi < 0 || gi >= ph.numCuts)
+                    break;
+                if (static_cast<float>(unit) < cu + ph.cuts[gi].units)
+                {
+                    cutOut = gi;
+                    break;
+                }
+                cu += ph.cuts[gi].units;
+            }
+            break;
+        }
+    }
+
+    void visRestoreLivePhrase()
+    {
+        vis.beginPhraseWrite();
+        vis.phrase = savedPhrase;
+        vis.endPhraseWrite();
+        visBlockIndex = savedVisBlockIndex;
+        visBlockFirstCut = savedVisBlockFirstCut;
+        vis.freezeRegionCount.store(0, std::memory_order_release);
+        freezePhraseActive = false;
+    }
+
+    // ---- freeze recording / replay -----------------------------------------------------------
+    // The freeze loop is a recording of the final output, so what you hear when you press the
+    // button is exactly what replays. The recording is always made at a bar line; the button only
+    // arms the change, which keeps the host grid and the captured phrase in phase.
+
+    void resizeFreezeHistory(size_t wanted)
+    {
+        if (wanted == 0 || wanted == freezeHistoryCap)
+            return;
+
+        std::vector<float> nl(wanted, 0.f), nr(wanted, 0.f);
+        const size_t keep = std::min(freezeHistoryFilled, wanted);
+        for (size_t k = 0; k < keep; ++k)
+        {
+            const uint64_t abs = freezeOutSeq - keep + k;
+            const size_t oldIdx = freezeHistoryCap ? static_cast<size_t>(abs % freezeHistoryCap) : 0;
+            const size_t newIdx = static_cast<size_t>(abs % wanted);
+            nl[newIdx] = freezeHistoryL[oldIdx];
+            nr[newIdx] = freezeHistoryR[oldIdx];
+        }
+        freezeHistoryL.swap(nl);
+        freezeHistoryR.swap(nr);
+        freezeHistoryCap = wanted;
+        freezeHistoryFilled = keep;
+        freezeHistoryPos = static_cast<size_t>(freezeOutSeq % wanted);
+    }
+
+    void pruneFreezeEvents()
+    {
+        const uint64_t cutoff = freezeOutSeq > freezeHistoryCap ? freezeOutSeq - freezeHistoryCap : 0;
+        // Keep the event that started before the window if its successor is still inside it.
+        while (freezeCutEvents.size() >= 2 && freezeCutEvents[1].seq < cutoff)
+            freezeCutEvents.pop_front();
+    }
+
+    void captureFrozenLoop(size_t loopSamples)
+    {
+        if (loopSamples == 0 || freezeHistoryCap == 0)
+            return;
+
+        const size_t len = std::min(std::min(freezeHistoryFilled, freezeHistoryCap), loopSamples);
+        frozenLoopL.assign(loopSamples, 0.f);
+        frozenLoopR.assign(loopSamples, 0.f);
+        const size_t pad = loopSamples - len;
+        const uint64_t firstSeq = freezeOutSeq - len;
+
+        for (size_t k = 0; k < len; ++k)
+        {
+            const size_t idx = static_cast<size_t>((firstSeq + k) % freezeHistoryCap);
+            frozenLoopL[pad + k] = freezeHistoryL[idx];
+            frozenLoopR[pad + k] = freezeHistoryR[idx];
+        }
+
+        frozenRegions.clear();
+        for (size_t i = 0; i < freezeCutEvents.size(); ++i)
+        {
+            const FreezeCutEvent& e = freezeCutEvents[i];
+            if (e.seq >= freezeOutSeq)
+                continue;
+            const uint64_t nextSeq = i + 1 < freezeCutEvents.size() ? freezeCutEvents[i + 1].seq : freezeOutSeq;
+            if (nextSeq <= firstSeq)
+                continue;
+
+            const uint64_t s = std::max(e.seq, firstSeq);
+            const uint64_t end = std::min(nextSeq, static_cast<uint64_t>(freezeOutSeq));
+            if (end <= s)
+                continue;
+
+            const uint64_t dutyAbs = std::min(e.seq + e.audible, static_cast<uint64_t>(freezeOutSeq));
+            size_t rs = pad + static_cast<size_t>(s - firstSeq);
+            size_t re = pad + static_cast<size_t>(end - firstSeq);
+            size_t rd = pad + static_cast<size_t>(dutyAbs > firstSeq ? dutyAbs - firstSeq : 0);
+            rd = std::min(re, std::max(rs, rd));
+
+            FrozenRegion fr;
+            fr.vis.start = static_cast<float>(rs) / static_cast<float>(loopSamples);
+            fr.vis.end = static_cast<float>(re) / static_cast<float>(loopSamples);
+            fr.vis.dutyEnd = static_cast<float>(rd) / static_cast<float>(loopSamples);
+            fr.vis.color = e.color;
+            fr.amp = e.amp;
+            fr.pan = e.pan;
+            fr.cents = e.cents;
+            frozenRegions.push_back(fr);
+        }
+
+        if (frozenRegions.empty())
+        {
+            FrozenRegion fr;
+            fr.vis.start = 0.f;
+            fr.vis.end = 1.f;
+            fr.vis.dutyEnd = 1.f;
+            fr.vis.color = 0;
+            frozenRegions.push_back(fr);
+        }
+
+        // The capture-buffer waveform is the recorded output itself, not the pre-slicer input.
+        std::memset(vis.bufferPeakL, 0, sizeof(vis.bufferPeakL));
+        std::memset(vis.bufferPeakR, 0, sizeof(vis.bufferPeakR));
+        for (size_t k = 0; k < loopSamples; ++k)
+        {
+            const int bin = static_cast<int>((static_cast<int64_t>(k) * LiveCutVis::kBufferBins) / loopSamples);
+            const float al = std::fabs(frozenLoopL[k]), ar = std::fabs(frozenLoopR[k]);
+            if (al > vis.bufferPeakL[bin]) vis.bufferPeakL[bin] = al;
+            if (ar > vis.bufferPeakR[bin]) vis.bufferPeakR[bin] = ar;
+        }
+
+        captureSize = static_cast<long>(loopSamples);
+        vis.bufferId.fetch_add(1, std::memory_order_relaxed);
+        visBuildFreezeVisuals();
+    }
+
+    void engageFreeze(size_t loopSamples)
+    {
+        savedPhrase = vis.phrase;
+        savedVisBlockIndex = visBlockIndex;
+        savedVisBlockFirstCut = visBlockFirstCut;
+        reverbSends.SetFreeze(true);
+        captureFrozenLoop(loopSamples);
+
+        // Remember where the captured window ends in the cutter's phrase. The loop is the two
+        // bars BEFORE this bar line, so its first sample is anchorUnit - 2*subdiv, not the last
+        // two bars of the phrase (the phrase is randomly 1-4 bars long and can end much later).
+        freezeAnchorUnit = static_cast<int>(bbcutter.GetUnitsDone());
+        vis.freezeAnchorUnit.store(freezeAnchorUnit, std::memory_order_relaxed);
+
+        freezeActive = true;
+        freezeArmed = false;
+        freezeReleaseArmed = false;
+        freezePhraseActive = true;
+        freezePlayPos = 0;
+        frozenRegionIndex = 0;
+        frozenEnv = frozenRegions.empty() ? 1.f : frozenRegions[0].amp;
+        scopeFlags |= LiveCutVis::kFlagBlockStart | LiveCutVis::kFlagCutStart;
+        vis.frozen.store(true, std::memory_order_relaxed);
+    }
+
+    void releaseFreeze()
+    {
+        freezeActive = false;
+        freezeArmed = false;
+        freezeReleaseArmed = false;
+        reverbSends.SetFreeze(false);
+        visRestoreLivePhrase();
+        vis.frozen.store(false, std::memory_order_relaxed);
+        vis.freezeAnchorUnit.store(0, std::memory_order_relaxed);
+        freezeHistoryFilled = 0;
+        freezeCutEvents.clear();
+        frozenLoopL.clear();
+        frozenLoopR.clear();
+        frozenRegions.clear();
+        frozenRegionIndex = 0;
+        captureSize = player.GetBufferSize();
+        resyncCutterAfterFreeze = true;
+        scopeFlags |= LiveCutVis::kFlagBlockStart | LiveCutVis::kFlagCutStart;
+    }
+
+    int frozenRegionAt(size_t pos) const
+    {
+        if (frozenRegions.empty() || frozenLoopL.empty())
+            return -1;
+        for (size_t i = 0; i < frozenRegions.size(); ++i)
+            if (pos < static_cast<size_t>(frozenRegions[i].vis.end * frozenLoopL.size()))
+                return static_cast<int>(i);
+        return static_cast<int>(frozenRegions.size()) - 1;
     }
 
     // Publish the value currently selected for every min/max range knob, so the UI can rotate its pointer.
@@ -707,6 +971,10 @@ protected:
             parameter.name = "Effect Route";
             parameter.hints |= kParameterIsInteger;
             break;
+        case LVC_FREEZE:
+            parameter.name = "Freeze";
+            parameter.hints |= kParameterIsBoolean;
+            break;
         }
 
         // one table of symbols shared with the UI's preset files; must match the names set above
@@ -837,6 +1105,8 @@ protected:
         case LVC_RVSIZE:     reverb.setSize(control[i]); break;
         case LVC_RVDAMP:     reverb.setDamp(control[i]); break;
         case LVC_EUSLICE:     bbcutter.SetEuclidSlice(static_cast<long>(control[i] + 0.5f)); break;
+        case LVC_FREEZE:
+            break; // applied at the start of run(), so the audio thread never reconfigures from a host callback
         default:
             if (i >= LVC_GATEENV1 && i < LVC_GATEENV1 + LVC_GATE_ENV_PARAMS)
                 bbcutter.SetGateEnvelope(static_cast<long>(i - LVC_GATEENV1), gateEnvPacked(control[i]));
@@ -927,6 +1197,8 @@ protected:
         cutoffCoef = 1.0f - std::exp(-1.0f / (0.002f * static_cast<float>(sampleRate))); // ~2 ms: follows each cut
         gateCoef = 1.0f - std::exp(-1.0f / (0.006f * static_cast<float>(sampleRate)));   // ~6 ms
         freeRunPpq = 0.0;
+        freezeApplied = false;
+        resyncCutterAfterFreeze = false;
 
         // Chroma
         chroma.setSampleRate(sampleRate);
@@ -1018,6 +1290,11 @@ protected:
         if (pendingDiv != div)
             applySubdiv(pendingDiv);
 
+        // ---- freeze: hold the last two bars of captured audio instead of picking fresh chops.
+        // The parameter is read on the audio thread only; host/UI writes are not allowed to reconfigure DSP.
+        const bool freezeOn = control[LVC_FREEZE] > 0.5f;
+        // the transition is applied once the bar length for this block is known (below)
+
         // ---- Chroma: settings, on/off, latency ----
        #if DISTRHO_PLUGIN_WANT_MIDI_INPUT
         handleMidi(midiEvents, midiEventCount);
@@ -1085,6 +1362,45 @@ protected:
             freeRunPpq += (static_cast<double>(frames) / sampleRate) * (bpm / 60.0);
         }
 
+        const double samplesPerBar = sampleRate * 60.0 / bpm * beats_per_bar * 4.0 / beat_unit;
+
+        // A stopped host no longer advances the grid, so no bar line arrives to commit a pending
+        // freeze release and a frozen loop would keep replaying forever. Free-running hosts have
+        // no valid BBT position, so they are never treated as stopped.
+        const bool hostStopped = timePos.bbt.valid && ! timePos.playing;
+
+        // Rolling two-bar capture of the final output. Freeze only arms here: the snapshot and the
+        // switch to the loop happen on the next bar line, so the phrase stays in phase with the host.
+        const size_t loopSamples = static_cast<size_t>(std::max(1.0, std::ceil(2.0 * samplesPerBar)));
+        if (! freezeActive)
+            resizeFreezeHistory(loopSamples);
+
+        if (freezeOn != freezeApplied)
+        {
+            freezeApplied = freezeOn;
+            if (freezeOn)
+            {
+                freezeReleaseArmed = false; // re-pressed before release: keep the current loop
+                if (! freezeActive)
+                {
+                    freezeArmed = true;
+                }
+            }
+            else
+            {
+                freezeArmed = false; // cancelled before the bar line
+                if (freezeActive)
+                {
+                    // No bar line will arrive while the transport is stopped, so commit the
+                    // release now instead of leaving the loop armed indefinitely.
+                    if (hostStopped)
+                        releaseFreeze();
+                    else
+                        freezeReleaseArmed = true;
+                }
+            }
+        }
+
         // Chroma in front of the slicer delays the audio it records by a frame: run the slicer's grid as late,
         // so cuts still fall on the beat of what it hears (the reported latency puts it back in time)
         if (chromaPre && chromaLatency > 0)
@@ -1120,21 +1436,28 @@ protected:
             lastFillCycle = fillCycle;
             lastFillBars = fillBars;
             fillZoneActive = fillOn ? inFill(oldmeasure) : true;
-            bbcutter.SetPhraseLimit(fillOn && fillZoneActive ? fillCycle - barInCycle(oldmeasure) : 0);
+            if (! freezeActive)
+                bbcutter.SetPhraseLimit(fillOn && fillZoneActive ? fillCycle - barInCycle(oldmeasure) : 0);
         }
 
-        // advances the cutter, starting a fresh (length-capped) phrase when a fill begins
+        // advances the cutter, starting a fresh (length-capped) phrase when a fill begins.
+        // While frozen the host grid is still tracked, but the cutter is not allowed to pick new blocks.
         auto advance = [&](long measure, long pim) {
             if (fillOn && measure != lastMeasureSeen)
             {
                 const bool zone = inFill(measure);
-                if (zone && ! fillZoneActive && pim == 0)
+                if (! freezeActive && zone && ! fillZoneActive && pim == 0)
                     bbcutter.ResetPhrase();
                 fillZoneActive = zone;
-                bbcutter.SetPhraseLimit(zone ? fillCycle - barInCycle(measure) : 0);
+                if (! freezeActive)
+                    bbcutter.SetPhraseLimit(zone ? fillCycle - barInCycle(measure) : 0);
             }
             lastMeasureSeen = measure;
-            bbcutter.SetPosition(measure, pim);
+            if (! freezeActive || resyncCutterAfterFreeze)
+            {
+                bbcutter.SetPosition(measure, pim);
+                resyncCutterAfterFreeze = false;
+            }
         };
 
         if (positionInMeasure != oldpositionInMeasure)
@@ -1142,11 +1465,17 @@ protected:
             oldpositionInMeasure = positionInMeasure;
             advance(oldmeasure, oldpositionInMeasure);
         }
+        if (resyncCutterAfterFreeze)
+        {
+            // no grid crossing in this block: rejoin the host position right away on release
+            bbcutter.SetPhraseLimit(fillOn && fillZoneActive ? fillCycle - barInCycle(oldmeasure) : 0);
+            bbcutter.SetPosition(oldmeasure, oldpositionInMeasure);
+            resyncCutterAfterFreeze = false;
+        }
 
         gateApplyPattern();
 
         // ---- visualisation setup for this block ----
-        const double samplesPerBar = sampleRate * 60.0 / bpm * beats_per_bar * 4.0 / beat_unit;
         const uint32_t samplesPerColumn = std::max<uint32_t>(1u,
             static_cast<uint32_t>(samplesPerBar * LiveCutVis::kScopeBars / LiveCutVis::kScopeColumns + 0.5));
         vis.columnsPerBar.store(static_cast<float>(samplesPerBar / samplesPerColumn), std::memory_order_relaxed);
@@ -1241,6 +1570,19 @@ protected:
         {
             positionInMeasure = unitInMeasure(position - ref);
             const long measure = static_cast<long>(std::floor((position - ref) / div));
+            const bool barLine = positionInMeasure == 0 && oldpositionInMeasure != 0;
+
+            // Quantised freeze: the button only arms the change; the snapshot and loop start on
+            // the next bar line. This must run BEFORE advance(): the cutter picks a fresh random
+            // block on the bar line, and the phrase map saved with the loop has to be the one the
+            // captured audio was cut with — otherwise LIVE CUTS shows a different set of slices.
+            if (barLine)
+            {
+                if (freezeArmed && freezeHistoryCap > 0 && freezeHistoryFilled >= freezeHistoryCap)
+                    engageFreeze(loopSamples);
+                else if (freezeReleaseArmed)
+                    releaseFreeze();
+            }
 
             if (positionInMeasure != oldpositionInMeasure)
             {
@@ -1260,10 +1602,13 @@ protected:
             if (blockCounter != lastBlockCounter)
             {
                 lastBlockCounter = blockCounter;
-                captureSize = player.GetBufferSize();
-                std::memset(vis.bufferPeakL, 0, sizeof(vis.bufferPeakL));
-                std::memset(vis.bufferPeakR, 0, sizeof(vis.bufferPeakR));
-                vis.bufferId.fetch_add(1, std::memory_order_relaxed);
+                if (! freezeActive)
+                {
+                    captureSize = player.GetBufferSize();
+                    std::memset(vis.bufferPeakL, 0, sizeof(vis.bufferPeakL));
+                    std::memset(vis.bufferPeakR, 0, sizeof(vis.bufferPeakR));
+                    vis.bufferId.fetch_add(1, std::memory_order_relaxed);
+                }
                 scopeFlags |= LiveCutVis::kFlagBlockStart | LiveCutVis::kFlagCutStart;
                 lastCutIdx = 0;
                 visMarkReverb(0);
@@ -1347,8 +1692,9 @@ protected:
             dlyWetSmooth += smoothCoef * (dlyWetTarget - dlyWetSmooth);
             dlyDrySmooth += smoothCoef * (dlyDryTarget - dlyDrySmooth);
 
-            // fill gate: outside the fill the output is dry (smoothed to avoid clicks)
-            gateSmooth += gateCoef * ((fillOn && ! fillZoneActive ? 0.f : 1.f) - gateSmooth);
+            // fill gate: outside the fill the output is dry (smoothed to avoid clicks).
+            // A frozen phrase stays audible even if the host has moved past the fill zone.
+            gateSmooth += gateCoef * ((fillOn && ! fillZoneActive && ! freezeActive ? 0.f : 1.f) - gateSmooth);
 
             // ---- effects: the same code wherever an effect sits in the route ----
             auto applyFx = [&](int fx, float& l, float& r) {
@@ -1484,6 +1830,55 @@ protected:
 
             float l = 0.f;
             float r = 0.f;
+            float oL = 0.f, oR = 0.f;
+            long cutIdx = -1;
+            const bool frozenActive = freezeActive && ! frozenLoopL.empty();
+            const bool playingFrozen = frozenActive && ! hostStopped;
+
+            if (frozenActive)
+            {
+              if (playingFrozen)
+              {
+                // Replay the recorded output verbatim: this is exactly the phrase that was heard
+                // before the button was pressed, with its chops and cut-synced effects already baked in.
+                oL = frozenLoopL[freezePlayPos];
+                oR = frozenLoopR[freezePlayPos];
+
+                const int oldRegion = frozenRegionIndex;
+                frozenRegionIndex = frozenRegionAt(freezePlayPos);
+                frozenEnv = frozenRegionIndex >= 0
+                    ? frozenRegions[static_cast<size_t>(frozenRegionIndex)].amp : 1.f;
+                if (frozenRegionIndex != oldRegion)
+                {
+                    scopeFlags |= LiveCutVis::kFlagBlockStart | LiveCutVis::kFlagCutStart;
+                    lastCutIdx = frozenRegionIndex;
+                }
+                if (frozenRegionIndex >= 0)
+                {
+                    const FrozenRegion& fr = frozenRegions[static_cast<size_t>(frozenRegionIndex)];
+                    const size_t rp = static_cast<size_t>(fr.vis.end * frozenLoopL.size());
+                    const size_t dp = static_cast<size_t>(fr.vis.dutyEnd * frozenLoopL.size());
+                    if (freezePlayPos >= dp && freezePlayPos < rp)
+                        scopeFlags |= LiveCutVis::kFlagSilent;
+                }
+
+                ++freezePlayPos;
+                if (freezePlayPos >= frozenLoopL.size())
+                {
+                    freezePlayPos = 0;
+                    frozenRegionIndex = frozenRegionAt(0);
+                    scopeFlags |= LiveCutVis::kFlagBlockStart | LiveCutVis::kFlagCutStart;
+                }
+              }
+              else
+              {
+                // Host transport stopped while frozen: hold the loop position and stay silent.
+                oL = 0.f;
+                oR = 0.f;
+              }
+            }
+            else
+            {
             player.tick(l, r, srcL, srcR);
 
             // trance gate filter: the gate envelope pulls a lowpass down / a highpass up (open when the step is open)
@@ -1523,7 +1918,7 @@ protected:
                 if (ar > vis.bufferPeakR[bin]) vis.bufferPeakR[bin] = ar;
             }
 
-            const long cutIdx = player.GetCurrentCut();
+            cutIdx = player.GetCurrentCut();
             if (cutIdx != lastCutIdx)
             {
                 lastCutIdx = cutIdx;
@@ -1533,6 +1928,21 @@ protected:
                 // insert mode: the reverb sits in the slice path, so a new slice cuts its tail
                 if (reverbInsert)
                     reverb.reset();
+
+                // Remember the chop that actually started, so freeze can replay the heard phrase.
+                if (freezeHistoryCap > 0 && cutIdx >= 0 && cutIdx < player.GetNumCuts())
+                {
+                    const CutInfo& ci = player.GetCuts()[cutIdx];
+                    FreezeCutEvent ev;
+                    ev.seq = freezeOutSeq;
+                    ev.audible = static_cast<size_t>(std::max(0L, ci.length));
+                    ev.color = static_cast<int16_t>(cutIdx);
+                    ev.amp = ci.amp;
+                    ev.pan = ci.pan;
+                    ev.cents = ci.cents;
+                    freezeCutEvents.push_back(ev);
+                    pruneFreezeEvents();
+                }
             }
 
             // after the slicer
@@ -1540,8 +1950,8 @@ protected:
                 applyFx(postFx[k], l, r);
 
             const float wet = mixSmooth * gateSmooth;
-            float oL = mixDryL + wet * (l - mixDryL);
-            float oR = mixDryR + wet * (r - mixDryR);
+            oL = mixDryL + wet * (l - mixDryL);
+            oR = mixDryR + wet * (r - mixDryR);
 
             // send-mode tails are added after the gate so they can ring over the dry part
             if (! reverbInsert && revOnSmooth > 1e-4f)
@@ -1576,6 +1986,19 @@ protected:
             makeupSmooth += smoothCoef * (makeupTarget - makeupSmooth);
             oL *= makeupSmooth;
             oR *= makeupSmooth;
+            } // !frozenActive
+
+            // Record the final output while live. Freeze replays this verbatim, so the phrase is
+            // exactly the one that was heard rather than a fresh randomisation of the cut list.
+            if (! frozenActive && freezeHistoryCap > 0)
+            {
+                freezeHistoryL[freezeHistoryPos] = oL;
+                freezeHistoryR[freezeHistoryPos] = oR;
+                freezeHistoryPos = (freezeHistoryPos + 1) % freezeHistoryCap;
+                ++freezeOutSeq;
+                if (freezeHistoryFilled < freezeHistoryCap)
+                    ++freezeHistoryFilled;
+            }
 
             outL[i] = oL;
             outR[i] = oR;
@@ -1586,7 +2009,7 @@ protected:
             if (mono < scopeMinAcc) scopeMinAcc = mono;
             if (mono > scopeMaxAcc) scopeMaxAcc = mono;
             if (inAbs > scopeInAcc) scopeInAcc = inAbs;
-            scopeEnvAcc += player.GetLastGain();
+            scopeEnvAcc += playingFrozen ? frozenEnv : player.GetLastGain();
             peakIn = std::max(peakIn, inAbs);
             peakOut = std::max(peakOut, std::max(std::fabs(oL), std::fabs(oR)));
 
@@ -1598,10 +2021,14 @@ protected:
                 vis.scopeMin[c] = scopeMinAcc;
                 vis.scopeMax[c] = scopeMaxAcc;
                 vis.scopeIn[c]  = scopeInAcc;
-                const bool hasCuts = player.GetNumCuts() > 0 && cutIdx < player.GetNumCuts();
-                vis.scopeBlock[c] = hasCuts ? static_cast<int16_t>(visBlockIndex) : -1;
+                const bool hasCuts = playingFrozen
+                    ? frozenRegionIndex >= 0
+                    : (player.GetNumCuts() > 0 && cutIdx >= 0 && cutIdx < player.GetNumCuts());
+                // The frozen scope is coloured from the recorded chops, not from the stopped cutter.
+                vis.scopeBlock[c] = hasCuts
+                    ? static_cast<int16_t>(playingFrozen ? frozenVisBlock : visBlockIndex) : -1;
                 uint8_t flags = scopeFlags;
-                if (hasCuts && player.GetReadIndex() >= player.GetCuts()[cutIdx].length)
+                if (! playingFrozen && hasCuts && player.GetReadIndex() >= player.GetCuts()[cutIdx].length)
                     flags |= LiveCutVis::kFlagSilent;
                 if (gateSmooth < 0.5f)
                     flags |= LiveCutVis::kFlagBypass;
@@ -1661,6 +2088,7 @@ protected:
         vis.gateMask.store(static_cast<uint32_t>(bbcutter.GetGateMask()), std::memory_order_relaxed);
         vis.gateEnv.store(gateEnvSmooth, std::memory_order_relaxed);
 
+        vis.frozen.store(freezeActive, std::memory_order_relaxed);
         vis.fillMode.store(fillOn, std::memory_order_relaxed);
         vis.fillActive.store(! fillOn || fillZoneActive, std::memory_order_relaxed);
         vis.barInCycle.store(static_cast<int32_t>(barInCycle(oldmeasure)), std::memory_order_relaxed);
@@ -1685,7 +2113,9 @@ protected:
         const long oldDiv = div;
         div = newDiv;
         bbcutter.SetSubdiv(div);
-        if (oldDiv <= 0)
+        // While frozen the loop owns the phrase map; rescaling it would redraw the
+        // recorded chops on a grid that has nothing to do with the captured audio.
+        if (oldDiv <= 0 || freezePhraseActive)
             return;
         const float f = static_cast<float>(newDiv) / static_cast<float>(oldDiv);
         vis.beginPhraseWrite();
@@ -1749,7 +2179,7 @@ protected:
                 continue;
             player.SetCutLength(j, want);
             const int gi = visBlockFirstCut + static_cast<int>(j);
-            if (visBlockIndex >= 0 && gi >= 0 && gi < vis.phrase.numCuts)
+            if (! freezePhraseActive && visBlockIndex >= 0 && gi >= 0 && gi < vis.phrase.numCuts)
             {
                 if (! writing)
                 {
@@ -1765,14 +2195,62 @@ protected:
 
     void publishLiveState(double position)
     {
+        if (freezePhraseActive && !frozenLoopL.empty())
+        {
+            const size_t n = frozenLoopL.size();
+            const size_t pos = std::min(freezePlayPos, n - 1);
+            const float phase = static_cast<float>(pos) / static_cast<float>(n);
+
+            // The captured loop is the two bars that ended at freezeAnchorUnit. Move the playhead
+            // over exactly that window of the preserved phrase map (wrapping if the phrase is
+            // shorter than the loop or the window straddles a phrase boundary). This keeps the
+            // highlighted slices in step with the audio that is actually replaying.
+            const int totalUnits = std::max(1, vis.phrase.totalUnits);
+            const int loopSpan = 2 * std::max(1, static_cast<int>(bbcutter.GetSubdiv()));
+            const float rawUnit = static_cast<float>(freezeAnchorUnit - loopSpan) + phase * static_cast<float>(loopSpan);
+            const int unit = static_cast<int>(std::fmod(std::fmod(rawUnit, static_cast<float>(totalUnits)) +
+                                                        static_cast<float>(totalUnits), static_cast<float>(totalUnits)));
+            int blk = -1, cut = -1;
+            frozenPhrasePos(unit, blk, cut);
+            frozenVisBlock = blk;
+            vis.unitPos.store(static_cast<float>(unit), std::memory_order_relaxed);
+            vis.currentBlock.store(blk, std::memory_order_relaxed);
+            vis.playPos.store(phase, std::memory_order_relaxed);
+            vis.recPos.store(-1.f, std::memory_order_relaxed);
+
+            if (frozenRegionIndex >= 0 && static_cast<size_t>(frozenRegionIndex) < frozenRegions.size())
+            {
+                const FrozenRegion& fr = frozenRegions[static_cast<size_t>(frozenRegionIndex)];
+                vis.currentCut.store(cut, std::memory_order_relaxed);
+                vis.cutRepeat.store(fr.vis.color, std::memory_order_relaxed);
+                vis.cutsInBlock.store(blk >= 0 && blk < vis.phrase.numBlocks
+                                      ? static_cast<int32_t>(vis.phrase.blocks[blk].numCuts) : 0,
+                                      std::memory_order_relaxed);
+                vis.cutStart.store(fr.vis.start, std::memory_order_relaxed);
+                vis.cutEnd.store(fr.vis.end, std::memory_order_relaxed);
+                vis.dutyEnd.store(fr.vis.dutyEnd, std::memory_order_relaxed);
+                vis.cutAmp.store(fr.amp, std::memory_order_relaxed);
+                vis.fadeFrac.store(0.1f, std::memory_order_relaxed);
+            }
+            else
+            {
+                vis.currentCut.store(-1, std::memory_order_relaxed);
+                vis.cutRepeat.store(0, std::memory_order_relaxed);
+                vis.cutsInBlock.store(0, std::memory_order_relaxed);
+                vis.cutStart.store(0.f, std::memory_order_relaxed);
+                vis.cutEnd.store(1.f, std::memory_order_relaxed);
+                vis.dutyEnd.store(1.f, std::memory_order_relaxed);
+            }
+            return;
+        }
+
         const long numCuts = player.GetNumCuts();
         const long cut = player.GetCurrentCut();
-
-        vis.currentBlock.store(visBlockIndex, std::memory_order_relaxed);
 
         const double frac = position - std::floor(position);
         const float unitPos = static_cast<float>(std::max(0.0, static_cast<double>(bbcutter.GetUnitsDone() - 1) + frac));
         vis.unitPos.store(unitPos, std::memory_order_relaxed);
+        vis.currentBlock.store(visBlockIndex, std::memory_order_relaxed);
 
         if (numCuts <= 0 || cut >= numCuts || captureSize <= 0)
         {
@@ -1788,8 +2266,10 @@ protected:
         const double ratio = std::fabs(ci.cents) > 1e-10 ? std::pow(2.0, ci.cents / 1200.0) : 1.0;
         const double bufSize = static_cast<double>(captureSize);
 
-        vis.currentCut.store(visBlockFirstCut + static_cast<int32_t>(cut), std::memory_order_relaxed);
-        vis.cutRepeat.store(static_cast<int32_t>(cut), std::memory_order_relaxed);
+        vis.currentCut.store(static_cast<int32_t>(freezePhraseActive ? cut : visBlockFirstCut + cut),
+                             std::memory_order_relaxed);
+        vis.cutRepeat.store(static_cast<int32_t>(freezePhraseActive && ci.fxCut >= 0 ? ci.fxCut : cut),
+                            std::memory_order_relaxed);
         vis.cutsInBlock.store(static_cast<int32_t>(numCuts), std::memory_order_relaxed);
         const double off = static_cast<double>(ci.offset);
         vis.recPos.store(static_cast<float>(std::min(1.0, player.GetInputIndex() / bufSize)), std::memory_order_relaxed);
@@ -1892,6 +2372,28 @@ private:
     uint8_t midiHeld[128] {};
     uint16_t midiLatched = 0;
     bool midiModeWas = false;
+
+    // freeze: the last two bars of the final output are recorded continuously, then replayed
+    // verbatim from the next bar line. The button arms the change; the bar line commits it.
+    bool freezeApplied = false;          // last state of the Freeze parameter
+    bool freezeArmed = false;            // parameter went on, waiting for a bar line
+    bool freezeReleaseArmed = false;     // parameter went off, waiting for a bar line
+    bool freezeActive = false;           // the recorded loop is currently playing
+    bool resyncCutterAfterFreeze = false;
+    std::vector<float> freezeHistoryL, freezeHistoryR;
+    size_t freezeHistoryCap = 0, freezeHistoryPos = 0, freezeHistoryFilled = 0;
+    uint64_t freezeOutSeq = 0;
+    std::deque<FreezeCutEvent> freezeCutEvents;
+    std::vector<float> frozenLoopL, frozenLoopR;
+    std::vector<FrozenRegion> frozenRegions;
+    size_t freezePlayPos = 0;
+    int freezeAnchorUnit = 0;   // cutter unit at the bar line where the loop was captured
+    int frozenRegionIndex = -1;
+    int frozenVisBlock = -1; // block in the preserved phrase under the frozen playhead
+    float frozenEnv = 1.f;
+    bool freezePhraseActive = false;
+    LiveCutVis::Phrase savedPhrase {};
+    int savedVisBlockIndex = -1, savedVisBlockFirstCut = 0;
 
     // fill mode
     float gateSmooth = 1.f, gateCoef = 0.004f;

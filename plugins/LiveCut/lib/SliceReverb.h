@@ -35,22 +35,53 @@ public:
     void SetSendRange(float a, float b)        { sendA = a; sendB = b; }
     void SetDecayRange(float a, float b)       { decayA = a; decayB = b; }
 
+    // While frozen the same block loops: replay the throw chosen for each cut on its first pass
+    // instead of rolling a new one every lap. Cuts not played yet are still free to roll once.
+    void SetFreeze(bool v)
+    {
+        frozen = v;
+        if (v)
+            for (int i = lastCut + 1; i < kMaxCachedCuts; ++i)
+                cached[i] = false;
+    }
+
     float Send() const  { return send; }   // send level for the cut playing now (0 = dry)
     float Decay() const { return decay; }  // decay (RT60, seconds) of the current tail
 
-    void OnCut(long, long) override
+    void OnCut(long cut, long) override
     {
+        if (cut >= 0 && cut < kMaxCachedCuts)
+            lastCut = static_cast<int>(cut);
+        if (cut >= 0 && cut < kMaxCachedCuts && frozen && cached[cut])
+        {
+            send = cachedSend[cut];
+            decay = cachedDecay[cut];
+            return;
+        }
         if (!on || rnd() >= chance)
         {
             send = 0.f;
+            if (cut >= 0 && cut < kMaxCachedCuts)
+            {
+                cachedSend[cut] = send;
+                cachedDecay[cut] = decay;
+                cached[cut] = true;
+            }
             return;
         }
         send = sendA + (sendB - sendA) * rnd();
         const float la = std::log(decayA), lb = std::log(decayB);
         decay = std::exp(la + (lb - la) * rnd());
+        if (cut >= 0 && cut < kMaxCachedCuts)
+        {
+            cachedSend[cut] = send;
+            cachedDecay[cut] = decay;
+            cached[cut] = true;
+        }
     }
 
 private:
+    static const int kMaxCachedCuts = 256;
     float rnd() // xorshift32, 0..1
     {
         state ^= state << 13;
@@ -63,6 +94,11 @@ private:
     float chance = 0.3f, sendA = 0.4f, sendB = 0.8f, decayA = 1.f, decayB = 3.f;
     float send = 0.f, decay = 2.f;
     uint32_t state = 0x2545F491u;
+    bool frozen = false;
+    int lastCut = -1;
+    bool cached[kMaxCachedCuts] = {};
+    float cachedSend[kMaxCachedCuts] = {};
+    float cachedDecay[kMaxCachedCuts] = {};
 };
 
 // ---------------------------------------------------------------------------------------------------------------------

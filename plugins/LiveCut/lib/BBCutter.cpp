@@ -33,6 +33,7 @@ CutInfo::CutInfo()
 , envtension(0.f)
 , tiedin(false)
 , tiedout(false)
+, fxCut(-1)
 {
 }
 
@@ -891,40 +892,217 @@ void LivePlayer::SetFade(float v)
   fade = v;
 }
 
+void LivePlayer::PrimeCut(long i)
+{
+  if(i<0 || i>=long(cuts.size()))
+    return;
+
+  // rotation matrix [ll lr; rl rr]
+  const float pan = cuts[i].pan;
+  const float amp = cuts[i].amp;
+  ll = amp * ((pan<0)? 1.f :  cos(pan*2*pi_4));
+  lr = amp * ((pan<0)? 0.f :  sin(pan*2*pi_4));
+  rl = amp * ((pan>0)? 0.f : -sin(pan*2*pi_4));
+  rr = amp * ((pan>0)? 1.f :  cos(pan*2*pi_4));
+
+  curpitched = fabs(cuts[i].cents) > 1e-10;
+  if(curpitched)
+  {
+    // resample from the cut's slice offset (0 for every algorithm except Euclid slices)
+    const long src0 = cuts[i].offset;
+    const double ratio = pow(2.f, cuts[i].cents/1200.f);
+    const long sz = std::min( long(pitchedbufferL.size()),
+                              (long(double(inputbufferL.size() - src0)/ratio)-1));
+    for(long k=0;k<sz;++k)
+    {
+      const long pos = src0 + long(float(k)*ratio);
+      const float frac = float(k)*ratio - float(pos);
+      const float a = inputbufferL[pos]*(1-frac)+inputbufferL[pos+1]*frac;
+      const float b = inputbufferR[pos]*(1-frac)+inputbufferR[pos+1]*frac;
+      pitchedbufferL[k] = a;
+      pitchedbufferR[k] = b;
+    }
+    L = &pitchedbufferL;
+    R = &pitchedbufferR;
+  }
+  else
+  {
+    L = &inputbufferL;
+    R = &inputbufferR;
+  }
+
+  // tell cut-synchrone effects. During freeze the expanded list is replayed, so pass the original
+  // cut index / count: every FX rate, filter, delay and send repeats exactly as on the first pass.
+  if(listenermanager)
+  {
+    const long fxCut = cuts[i].fxCut >= 0 ? cuts[i].fxCut : i;
+    const long fxNum = freezeFxNumCuts > 0 ? freezeFxNumCuts : long(cuts.size());
+    listenermanager->OnCut(fxCut, fxNum);
+  }
+}
+
+void LivePlayer::SetFreeze(bool v)
+{
+  freezeRequested = v;
+  if(!v)
+  {
+    if(freezeActive && !savedCuts.empty())
+    {
+      // Restore the live capture and the cut list that was playing when freeze was pressed.
+      // The next OnBlock replaces them again on the host grid, but until then the slicer must
+      // not keep replaying the frozen pattern.
+      inputbufferL = savedInputL;
+      inputbufferR = savedInputR;
+      pitchedbufferL = savedPitchedL;
+      pitchedbufferR = savedPitchedR;
+      cuts = savedCuts;
+      currentcut = savedCurrentCut;
+      readindex = savedReadIndex;
+      inputindex = savedInputIndex;
+      curpitched = savedCurPitched;
+      L = curpitched ? &pitchedbufferL : &inputbufferL;
+      R = curpitched ? &pitchedbufferR : &inputbufferR;
+      PrimeCut(std::min(currentcut, long(cuts.size()) - 1));
+      savedCuts.clear();
+    }
+    freezeActive = false;
+    freezeFxNumCuts = -1;
+    return;
+  }
+  if(cuts.empty())
+    return;
+
+  // pressed after the block already finished: restart it from the top and prime the first cut.
+  // If the buffer just filled mid-cut, the current cut is already primed; don't retrigger it.
+  const bool pastEnd = currentcut>=long(cuts.size());
+  if(pastEnd)
+  {
+    currentcut = 0;
+    readindex = 0;
+  }
+  if(inputindex>=long(inputbufferL.size()))
+  {
+    freezeActive = true;
+    if(pastEnd)
+      PrimeCut(currentcut);
+  }
+}
+
+void LivePlayer::BuildFreezeCuts(long loopLen)
+{
+  freezeCuts.clear();
+  if(cuts.empty() || loopLen <= 0)
+    return;
+
+  long patternLen = 0;
+  for(const CutInfo& c : cuts)
+    patternLen = std::max(patternLen, c.offset + c.size);
+  if(patternLen <= 0)
+    return;
+
+  // Repeat the exact same chop pattern across the two-bar snapshot. Every repeat starts a new
+  // cut list entry, so PrimeCut re-fires the per-cut filter / delay / crusher / reverb settings
+  // on every pass instead of leaving them stuck at one value.
+  for(long base = 0; base < loopLen; base += patternLen)
+  {
+    for(size_t cutIndex = 0; cutIndex < cuts.size(); ++cutIndex)
+    {
+      const CutInfo& src = cuts[cutIndex];
+      const long start = src.offset + base;
+      if(start >= loopLen)
+        break;
+
+      CutInfo c = src;
+      c.offset = start;
+      c.fxCut = static_cast<long>(cutIndex); // replay the original FX value, not an expanded-list one
+      long maxSize = loopLen - start;
+      if(std::fabs(c.cents) > 1e-10)
+      {
+        const double ratio = std::pow(2.0, double(c.cents) / 1200.0);
+        maxSize = std::min(maxSize, std::min(loopLen, long(double(loopLen - start) / ratio) - 1));
+      }
+      c.size = std::min(c.size, maxSize);
+      c.length = std::min(c.length, std::max(0L, c.size));
+      if(c.size <= 0)
+        continue;
+      freezeCuts.push_back(c);
+    }
+  }
+}
+
+void LivePlayer::SetFreezeLoop(const float* l, const float* r, long size)
+{
+  if(size <= 0 || l == nullptr || r == nullptr)
+  {
+    SetFreeze(true); // nothing captured yet: hold the current block until it is full
+    return;
+  }
+
+  // Keep the live state for a seamless release.
+  savedInputL = inputbufferL;
+  savedInputR = inputbufferR;
+  savedPitchedL = pitchedbufferL;
+  savedPitchedR = pitchedbufferR;
+  savedCuts = cuts;
+  // A block that finished just before freeze has currentcut == cuts.size(); restart it from 0
+  // on release instead of restoring an out-of-range index that would play silence.
+  savedCurrentCut = currentcut >= long(cuts.size()) ? 0 : currentcut;
+  savedReadIndex = savedCurrentCut == 0 ? 0 : readindex;
+  savedInputIndex = inputindex;
+  savedCurPitched = curpitched;
+  freezeFxNumCuts = static_cast<long>(cuts.size()); // FX automation follows the original pattern
+
+  inputbufferL.resize(size);
+  inputbufferR.resize(size);
+  pitchedbufferL.resize(size);
+  pitchedbufferR.resize(size);
+  for(long i = 0; i < size; ++i)
+  {
+    inputbufferL[i] = l[i];
+    inputbufferR[i] = r[i];
+  }
+
+  BuildFreezeCuts(size);
+  if(!freezeCuts.empty())
+    cuts = freezeCuts;
+
+  freezeRequested = true;
+  freezeActive = true;
+  inputindex = size; // snapshot is complete: the recording branch must stay off
+  currentcut = 0;
+  readindex = 0;
+  curpitched = false;
+  L = &inputbufferL;
+  R = &inputbufferR;
+  freezeLoopCount = 0;
+  lastgain = 1.f;
+  gateenv = 1.f;
+  PrimeCut(0); // cut-synchrone effects follow the first slice of the loop
+}
+
 void LivePlayer::OnBlock(std::vector<CutInfo> newcuts)
 {
   if(!newcuts.empty())
   {
     cuts = newcuts;
-    //rotation matrix
-    // [ll lr]
-    // [rl rr]
-    const float pan = cuts[0].pan;
-    const float amp = cuts[0].amp;
-    ll = amp * ((pan<0)? 1.f :  cos(pan*2*pi_4));
-    lr = amp * ((pan<0)? 0.f :  sin(pan*2*pi_4));
-    rl = amp * ((pan>0)? 0.f : -sin(pan*2*pi_4));
-    rr = amp * ((pan>0)? 1.f :  cos(pan*2*pi_4));
     inputindex = readindex = 0;
-    currentcut=0;
-    
-    // tell cut-synchrone effects
-    if(listenermanager)
-      listenermanager->OnCut(currentcut,cuts.size()); // allow interpolation...
-    
-    
+    currentcut = 0;
+
     long maxcutlength=0;
     for(int i=0;i<cuts.size();i++)
       if(cuts[i].offset+cuts[i].size>maxcutlength)
         maxcutlength = cuts[i].offset+cuts[i].size;
     curpitched = false;
-    
+
     inputbufferL.resize(maxcutlength,0.f);
     inputbufferR.resize(maxcutlength,0.f);
     pitchedbufferL.resize(maxcutlength,0.f);
     pitchedbufferR.resize(maxcutlength,0.f);
     L = &inputbufferL;
     R = &inputbufferR;
+
+    // prime the first cut (also tells cut-synchrone effects to interpolate)
+    PrimeCut(0);
   }
 }
 

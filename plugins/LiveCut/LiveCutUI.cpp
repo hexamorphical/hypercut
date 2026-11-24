@@ -92,7 +92,7 @@ static inline ImVec4 withA(const ImVec4& c, float a)
 }
 
 // The six-colour spectrum of the logo.
-// Used only by the HyperCut logo mark and the "HYPER" part of the wordmark.
+// Used only by the HyperCut logo mark and the "Cut" part of the wordmark.
 static const ImVec4 kLogoRainbow[6] = {
     hex(0xE65755), // red
     hex(0xF08B40), // orange
@@ -462,6 +462,7 @@ static UIPrefs loadPrefs()
     const std::string path = prefsFile();
     if (path.empty())
         return p;
+    bool sawCrt = false;
     if (FILE* f = std::fopen(path.c_str(), "r"))
     {
         char line[192];
@@ -485,7 +486,10 @@ static UIPrefs loadPrefs()
             else if (std::sscanf(line, "mode=%15s", sv) == 1)
                 p.dark = std::strcmp(sv, "light") != 0;
             else if (std::sscanf(line, "crt=%d", &iv) == 1)
+            {
                 p.crt = iv != 0;
+                sawCrt = true;
+            }
             else if (std::sscanf(line, "lang=%15s", sv) == 1)
                 p.lang = std::strcmp(sv, "es") == 0 ? kLangEs : kLangEn;
             else if (std::sscanf(line, "size=%ux%u", &w, &h) == 2)
@@ -496,6 +500,9 @@ static UIPrefs loadPrefs()
         }
         std::fclose(f);
     }
+    // Light mode starts with the CRT look off unless the user has chosen it explicitly.
+    if (! sawCrt)
+        p.crt = p.dark;
     return p;
 }
 
@@ -777,6 +784,7 @@ class HyperCutUI : public UI
     // visualisation
     LiveCutVis::State* vis = nullptr;
     LiveCutVis::Phrase phrase {};
+    LiveCutVis::Phrase prevPhrase {};
 
     // theme
     int themeIndex = 0;
@@ -814,7 +822,7 @@ class HyperCutUI : public UI
     bool sizeDirty = false;
 
     // visualiser zoom + envelope lanes (per window, not saved)
-    ViewZoom zBuf, zMap, zScope;
+    ViewZoom zBuf, zScope;
 
     float transMeter = 0.f; // transient shaper gain meter, held for display
 
@@ -860,6 +868,11 @@ class HyperCutUI : public UI
     GLuint crtNoise = 0;
     bool crtEnabled = true;
     uint32_t crtSeed = 0x9E3779B9u;
+
+    // Procedural frost textures used by the freeze overlay. One holds a cloudy ice-density map,
+    // the other a sharper vein map; they are composited with multiply + screen + additive passes.
+    GLuint frostBaseTex = 0;
+    GLuint frostVeinTex = 0;
 
     // Spectral Pitchmap: moved level per pitch class, smoothed for the keyboard glow
     float chGlow[12] {};
@@ -990,6 +1003,10 @@ protected:
                 glDeleteTextures(1, &crtScreens[i].tex);
         if (crtNoise != 0)
             glDeleteTextures(1, &crtNoise);
+        if (frostBaseTex != 0)
+            glDeleteTextures(1, &frostBaseTex);
+        if (frostVeinTex != 0)
+            glDeleteTextures(1, &frostVeinTex);
     }
 
     void parameterChanged(uint32_t index, float value) override
@@ -1669,6 +1686,20 @@ protected:
         savePrefs(p);
     }
 
+    void setDarkMode(bool dark)
+    {
+        if (darkMode == dark)
+            return;
+        darkMode = dark;
+        P.build(themeIndex, darkMode);
+        applyImGuiStyle();
+        // Light mode defaults to a clean, non-CRT look; switching back restores it.
+        crtEnabled = darkMode;
+        for (CrtScreen& sc : crtScreens)
+            sc.history = false;
+        persistPrefs();
+    }
+
     // ----------------------------------------------------------------------------------------------------------------
     // Parameter helpers
 
@@ -1920,8 +1951,8 @@ protected:
     }
 
     // Wordmark: the website's "hyperCut" camel-case lockup, set in Space Grotesk.
-    // "hyper" carries the full six-stop hero gradient; "Cut" follows the theme text colour.
-    float logoText(ImDrawList* dl, ImFont* f, ImVec2 pos, ImU32 cutCol) const
+    // "hyper" is plain black/white for the active theme; "Cut" carries the six-stop hero gradient.
+    float logoText(ImDrawList* dl, ImFont* f, ImVec2 pos, ImU32 plainCol) const
     {
         static const char hyper[6] = "hyper";
         static const char cut[4]   = "Cut";
@@ -1932,7 +1963,7 @@ protected:
         auto drawRun = [&](const char* text, int count, bool gradient) {
             for (int i = 0; i < count; ++i)
             {
-                ImU32 col = cutCol;
+                ImU32 col = plainCol;
                 if (gradient)
                     col = U32(logoGradientAt((static_cast<float>(i) + 0.5f) / static_cast<float>(count)));
                 char ch[2] = { text[i], '\0' };
@@ -1940,8 +1971,8 @@ protected:
                 x += f->GetCharAdvance(static_cast<ImWchar>(static_cast<unsigned char>(text[i]))) * scale + tracking;
             }
         };
-        drawRun(hyper, 5, true);
-        drawRun(cut, 3, false);
+        drawRun(hyper, 5, false);
+        drawRun(cut, 3, true);
         return x - pos.x - tracking;
     }
 
@@ -2167,6 +2198,71 @@ protected:
         dl->AddRect(a, b, U32(col, 0.30f), h * 0.5f, 0, 1.f);
         text(dl, fSmall, ImVec2(a.x + padX, a.y + 3.f * s), U32(col), label);
         outLeft = a.x - 6.f * s;
+    }
+
+    // six-armed snowflake, used by the freeze tab and the frozen overlay
+    void drawSnowflake(ImDrawList* dl, ImVec2 c, float r, ImU32 col, float thick = 1.f)
+    {
+        const float th = std::max(1.f, thick * s);
+        for (int k = 0; k < 6; ++k)
+        {
+            const float ang = k * IM_PI / 3.f;
+            const ImVec2 dir(std::cos(ang), std::sin(ang));
+            const ImVec2 perp(-dir.y, dir.x);
+            dl->AddLine(c, ImVec2(c.x + dir.x * r, c.y + dir.y * r), col, th);
+            const ImVec2 base(c.x + dir.x * r * 0.55f, c.y + dir.y * r * 0.55f);
+            for (int side = -1; side <= 1; side += 2)
+                dl->AddLine(base, ImVec2(base.x + (dir.x * 0.5f + perp.x * 0.42f * side) * r,
+                                         base.y + (dir.y * 0.5f + perp.y * 0.42f * side) * r), col, th);
+        }
+        dl->AddCircleFilled(c, std::max(1.f, r * 0.13f), col, 8);
+    }
+
+    // Freeze tab centred on the LIVE CUTS titlebar
+    bool freezeTab(ImDrawList* dl, ImVec2 centre)
+    {
+        const bool on = pv[LVC_FREEZE] > 0.5f;
+        const ImVec4 ice = P.dark ? hex(0xA8E8FF) : hex(0x247CA8);
+        const float w = 104.f * s, h = 22.f * s;
+        const ImVec2 a(centre.x - w * 0.5f, centre.y - h * 0.5f);
+        const ImVec2 b(centre.x + w * 0.5f, centre.y + h * 0.5f);
+
+        ImGui::PushID(9100 + static_cast<int>(LVC_FREEZE));
+        ImGui::SetCursorScreenPos(a);
+        const bool clicked = ImGui::InvisibleButton("##freezeTab", ImVec2(w, h));
+        if (clicked)
+            setParamGesture(LVC_FREEZE, on ? 0.f : 1.f);
+        const bool hov = ImGui::IsItemHovered();
+        const bool act = ImGui::IsItemActive();
+        ImGui::PopID();
+
+        const float rad = h * 0.5f;
+        if (on)
+        {
+            dl->AddRectFilled(a, b, U32(ice, hov ? 0.28f : 0.21f), rad);
+            dl->AddRect(a, b, U32(ice, 0.9f), rad, 0, 1.4f * s);
+            dl->AddLine(ImVec2(a.x + 9.f * s, a.y + 1.f), ImVec2(b.x - 9.f * s, a.y + 1.f), U32(ice, 0.5f), 1.f);
+        }
+        else
+        {
+            dl->AddRectFilled(a, b, U32(P.track, hov ? 1.5f : 1.f), rad);
+            dl->AddRect(a, b, U32(P.panelBorder), rad, 0, 1.f);
+        }
+
+        const ImVec2 ic(a.x + 13.f * s, centre.y);
+        drawSnowflake(dl, ic, 5.2f * s, U32(on ? ice : (hov ? P.text : P.textDim), on ? 1.f : 0.9f), 1.1f);
+        const char* label = on ? "FROZEN" : "FREEZE";
+        const ImVec2 ts = textSize(fSmall, label);
+        const float tx = a.x + 24.f * s + std::max(0.f, (w - 24.f * s - ts.x) * 0.5f);
+        text(dl, fSmall, ImVec2(tx, centre.y - ts.y * 0.5f),
+             U32(on ? ice : (hov ? P.text : P.textDim)), label);
+
+        if (hov || act)
+            tooltip("On the next bar line, capture the last two bars of the final output —\n"
+                    "exactly what you just heard — and loop it verbatim. Click again to rejoin the host grid.");
+        if (hov)
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        return clicked;
     }
 
     // ----------------------------------------------------------------------------------------------------------------
@@ -2729,6 +2825,150 @@ protected:
         ImGui::PopID();
     }
 
+    // Horizontal range control for a min/max parameter pair on a linear axis. Both handles
+    // can be dragged along the track; one tick is drawn per integer step.
+    void rangeSlider(ImDrawList* dl, uint32_t idxMin, uint32_t idxMax, const char* label,
+                     ImVec2 a, float width, bool enabled = true)
+    {
+        const float alpha = enabled ? 1.f : 0.38f;
+        const float fsh = fs(fSmall);
+        const float handleR = 6.f * s;
+        const float x0 = a.x + handleR, x1 = a.x + width - handleR;
+        const float trackY = a.y + fsh + 14.f * s;
+        const float rowH = 56.f * s;
+
+        ImGui::PushID(static_cast<int>(idxMin * 100 + idxMax));
+        ImGui::SetCursorScreenPos(a);
+        ImGui::InvisibleButton("##rangeSlider", ImVec2(width, rowH));
+        const bool hovered = ImGui::IsItemHovered();
+        const bool active = ImGui::IsItemActive();
+        const ImGuiIO& io = ImGui::GetIO();
+
+        float nMin = toNorm(idxMin, pv[idxMin]);
+        float nMax = toNorm(idxMax, pv[idxMax]);
+        auto mouseNorm = [&]() { return limit<float>((io.MousePos.x - x0) / (x1 - x0), 0.f, 1.f); };
+
+        if (ImGui::IsItemActivated())
+        {
+            const float m = mouseNorm();
+            rangeHandle = (std::fabs(m - nMin) <= std::fabs(m - nMax)) ? 0 : 1;
+            editParameter(idxMin, true);
+            editParameter(idxMax, true);
+        }
+        if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+        {
+            setParam(idxMin, LVC_DEFAULTS[idxMin]);
+            setParam(idxMax, LVC_DEFAULTS[idxMax]);
+        }
+        else if (active)
+        {
+            const float m = mouseNorm();
+            if (rangeHandle == 0) setParam(idxMin, fromNorm(idxMin, std::min(m, nMax)));
+            else                  setParam(idxMax, fromNorm(idxMax, std::max(m, nMin)));
+        }
+        else if (hovered && io.MouseWheel != 0.f)
+        {
+            const float m = mouseNorm();
+            const uint32_t target = std::fabs(m - nMin) <= std::fabs(m - nMax) ? idxMin : idxMax;
+            float v = pv[target] + (io.MouseWheel > 0.f ? 1.f : -1.f);
+            if (target == idxMin) v = std::min(v, pv[idxMax]);
+            else                  v = std::max(v, pv[idxMin]);
+            setParamGesture(target, v);
+        }
+        if (ImGui::IsItemDeactivated())
+        {
+            editParameter(idxMin, false);
+            editParameter(idxMax, false);
+        }
+
+        nMin = toNorm(idxMin, pv[idxMin]);
+        nMax = toNorm(idxMax, pv[idxMax]);
+
+        // integer ticks along the track
+        const int steps = static_cast<int>(controlLimits[idxMin].second - controlLimits[idxMin].first);
+        for (int k = 0; k <= steps; ++k)
+        {
+            const float x = x0 + (x1 - x0) * (steps > 0 ? k / static_cast<float>(steps) : 0.f);
+            dl->AddLine(ImVec2(x, trackY - 9.f * s), ImVec2(x, trackY - 6.f * s), U32(P.textFaint, 0.4f * alpha), 1.f);
+            char lb[8];
+            std::snprintf(lb, sizeof(lb), "%d", static_cast<int>(controlLimits[idxMin].first) + k);
+            textCentered(dl, fSmall, ImVec2(x, trackY + 11.f * s + fsh * 0.5f), U32(P.textFaint, 0.8f * alpha), lb);
+        }
+
+        // track and selected range
+        const float th = 6.f * s;
+        dl->AddRectFilled(ImVec2(x0 - th * 0.5f, trackY - th * 0.5f),
+                          ImVec2(x1 + th * 0.5f, trackY + th * 0.5f), U32(P.track, alpha), th * 0.5f);
+        const float loN = std::min(nMin, nMax), hiN = std::max(nMin, nMax);
+        const float fx0 = x0 + (x1 - x0) * loN, fx1 = x0 + (x1 - x0) * hiN;
+        if (hovered || active)
+            dl->AddRectFilled(ImVec2(fx0, trackY - th), ImVec2(std::max(fx1, fx0 + 1.f), trackY + th),
+                              U32(P.a, 0.18f * alpha), th);
+        gradRectTheme(dl, ImVec2(fx0, trackY - th * 0.5f), ImVec2(std::max(fx1, fx0 + 1.f), trackY + th * 0.5f),
+                      th * 0.5f, alpha);
+
+        // the value playing now, clamped to the selected range
+        const float cur = currentParamValue(idxMin);
+        if (cur >= 0.f)
+        {
+            const float nc = limit<float>(toNorm(idxMin, cur), loN, hiN);
+            const float cx = x0 + (x1 - x0) * nc;
+            dl->AddLine(ImVec2(cx, trackY - 8.f * s), ImVec2(cx, trackY + 8.f * s), U32(P.text, 0.9f * alpha), 2.f * s);
+            dl->AddTriangleFilled(ImVec2(cx - 4.f * s, trackY - 14.f * s),
+                                  ImVec2(cx + 4.f * s, trackY - 14.f * s),
+                                  ImVec2(cx, trackY - 8.f * s), U32(P.a, alpha));
+        }
+
+        // handles
+        for (int h = 0; h < 2; ++h)
+        {
+            const float n = h == 0 ? nMin : nMax;
+            const ImVec2 c(x0 + (x1 - x0) * n, trackY);
+            const bool hot = active && rangeHandle == h;
+            dl->AddCircleFilled(ImVec2(c.x, c.y + 1.5f * s), handleR, U32(P.shadow, alpha), 24);
+            gradCircle(dl, c, handleR, withA(P.knobTop, alpha), withA(P.knobBot, alpha));
+            dl->AddCircle(c, handleR, U32(h == 0 ? P.a : P.b, (hot ? 1.f : 0.85f) * alpha), 24,
+                          hot ? 2.2f * s : 1.6f * s);
+            if (hot) dl->AddCircleFilled(c, handleR * 2.f, U32(h == 0 ? P.a : P.b, 0.15f * alpha), 24);
+        }
+
+        char bmin[24], bmax[24], range[72], bcur[24], display[100];
+        formatCompact(idxMin, pv[idxMin], bmin, sizeof(bmin));
+        formatCompact(idxMax, pv[idxMax], bmax, sizeof(bmax));
+        if (std::strcmp(bmin, bmax) == 0) std::snprintf(range, sizeof(range), "%s", bmin);
+        else std::snprintf(range, sizeof(range), "%s \xe2\x80\x93 %s", bmin, bmax);
+        if (cur >= 0.f)
+        {
+            formatCompact(idxMin, cur, bcur, sizeof(bcur));
+            std::snprintf(display, sizeof(display), "%s (%s)", range, bcur);
+        }
+        else
+            std::snprintf(display, sizeof(display), "%s", range);
+        text(dl, fSmall, ImVec2(a.x, a.y), U32(P.textDim, alpha), label);
+        textRight(dl, fSmall, ImVec2(a.x + width, a.y),
+                  U32(hovered || active ? P.grad(0.6f) : (cur >= 0.f ? P.c : P.text), alpha), display);
+
+        if (hovered || active)
+        {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            char full[256];
+            formatValue(idxMin, pv[idxMin], bmin, sizeof(bmin));
+            formatValue(idxMax, pv[idxMax], bmax, sizeof(bmax));
+            if (cur >= 0.f)
+            {
+                formatValue(idxMin, cur, bcur, sizeof(bcur));
+                std::snprintf(full, sizeof(full), "%s: %s \xe2\x80\x93 %s (now %s)\nDrag either handle, wheel to fine-tune, double-click to reset.",
+                              label, bmin, bmax, bcur);
+            }
+            else
+                std::snprintf(full, sizeof(full), "%s: %s \xe2\x80\x93 %s\nDrag either handle, wheel to fine-tune, double-click to reset.",
+                              label, bmin, bmax);
+            tooltip("%s", full);
+        }
+
+        ImGui::PopID();
+    }
+
     // Segmented control for an enumerated/integer parameter. When `values` is supplied the labels map to
     // those parameter values (the gate's musical RATE names map onto subdivision indices). The selected
     // highlight glides to its new segment instead of jumping.
@@ -3075,7 +3315,7 @@ protected:
         const float top = pad, h = 52.f * s;
         const float cy = top + h * 0.5f;
 
-        // ---- logo: six bars in the "present" rainbow palette; "hyper" is coloured, "Cut" uses the theme ----
+        // ---- logo: six bars in the "present" rainbow palette; "hyper" is plain, "Cut" is the gradient ----
         {
             const float x = pad + 4.f * s;
             const float bw = 4.f * s, gap = 3.f * s;
@@ -3102,7 +3342,8 @@ protected:
 
             const float tx = x + 6 * (bw + gap) + 10.f * s;
             const float ty = cy - fs(fLogo) * 0.5f - 6.f * s;
-            const float logoW = logoText(dl, fLogo, ImVec2(tx, ty), U32(P.text));
+            const ImU32 plainLogo = U32(P.dark ? hex(0xFFFFFF) : hex(0x000000));
+            const float logoW = logoText(dl, fLogo, ImVec2(tx, ty), plainLogo);
 
             static const char subtitle[] = "BEAT SLICER  \xc2\xb7  v" HYPERCUT_DISPLAY_VERSION;
             const ImVec2 subSz = fSmall->CalcTextSizeA(fs(fSmall), FLT_MAX, 0.f, subtitle);
@@ -3181,12 +3422,7 @@ protected:
             const ImVec2 ma(x - 28.f * s, top), mb(x, top + bh);
             ImGui::SetCursorScreenPos(ma);
             if (ImGui::InvisibleButton("##mode", mb - ma))
-            {
-                darkMode = ! darkMode;
-                P.build(themeIndex, darkMode);
-                applyImGuiStyle();
-                persistPrefs();
-            }
+                setDarkMode(! darkMode);
             const bool mhov = ImGui::IsItemHovered();
             if (mhov)
             {
@@ -3971,12 +4207,7 @@ protected:
             ImGui::Dummy(ImVec2(w, 12.f * s));
             const ImVec2 r = ImGui::GetCursorScreenPos();
             if (ImGui::InvisibleButton("##darkrow", ImVec2(w, rh)))
-            {
-                darkMode = ! darkMode;
-                P.build(themeIndex, darkMode);
-                applyImGuiStyle();
-                persistPrefs();
-            }
+                setDarkMode(! darkMode);
             if (ImGui::IsItemHovered())
                 pdl->AddRectFilled(r, ImVec2(r.x + w, r.y + rh), U32(P.text, 0.05f), 8.f * s);
             text(pdl, fBody, ImVec2(r.x + 12.f * s, r.y + rh * 0.5f - fs(fBody) * 0.5f - 1.f * s), U32(P.text), "Dark mode");
@@ -4171,12 +4402,16 @@ protected:
         const int nIn = vis->cutsInBlock.load(std::memory_order_relaxed);
         const int curCut = vis->currentCut.load(std::memory_order_relaxed);
         const bool active = play >= 0.f && nIn > 0;
+        const bool frozen = vis->frozen.load(std::memory_order_relaxed);
+        const int nFreeze = frozen ? vis->freezeRegionCount.load(std::memory_order_acquire) : 0;
 
         // info chips
         {
             char buf[48];
             float x = b.x - 16.f * s;
             const float y = a.y + 12.f * s;
+            if (frozen)
+                chip(dl, ImVec2(x, y), "FROZEN", P.b, x);
             if (active)
             {
                 const bool gateNow = algoFromParams(pv) == kAlgoGate;
@@ -4254,13 +4489,54 @@ protected:
                 const float x = x0 + c * cw;
                 const float hl = std::max(1.f * s, std::pow(std::min(1.f, pl * zBuf.amp), 0.65f) * hh);
                 const float hr = std::max(1.f * s, std::pow(std::min(1.f, pr * zBuf.amp), 0.65f) * hh);
-                const bool inCut = active && t >= cutStart && t <= dutyEnd;
-                const bool played = active && t >= cutStart && t <= play;
-                const float al = ! active ? 0.35f : (played ? 1.f : (inCut ? 0.75f : 0.35f));
-                const ImVec4 colr = P.grad(t);
+                ImVec4 colr = P.grad(t);
+                float al;
+                if (frozen && nFreeze > 0)
+                {
+                    // Frozen: colour each waveform column by the chopped slice it belongs to, and
+                    // dim the duty-cycle gaps. The same regions drive the scope and phrase map.
+                    int ri = 0;
+                    while (ri < nFreeze && t >= vis->freezeRegions[ri].end)
+                        ++ri;
+                    if (ri < nFreeze)
+                    {
+                        const LiveCutVis::FreezeRegion& reg = vis->freezeRegions[ri];
+                        colr = P.blockColor(reg.color);
+                        const bool silent = t > reg.dutyEnd;
+                        const bool played = t >= reg.start && t <= play;
+                        al = silent ? 0.22f : (played ? 1.f : 0.72f);
+                    }
+                    else
+                        al = 0.2f;
+                }
+                else
+                {
+                    const bool inCut = active && t >= cutStart && t <= dutyEnd;
+                    const bool played = active && t >= cutStart && t <= play;
+                    al = ! active ? 0.35f : (played ? 1.f : (inCut ? 0.75f : 0.35f));
+                }
                 const float gapPx = cw > 3.f * s ? 1.f * s : 0.5f * s;
                 dl->AddRectFilled(ImVec2(x, midY - hl), ImVec2(x + cw - gapPx, midY - 0.5f * s), U32(colr, al), 1.f * s);
                 dl->AddRectFilled(ImVec2(x, midY + 0.5f * s), ImVec2(x + cw - gapPx, midY + hr), U32(colr, al * 0.8f), 1.f * s);
+            }
+        }
+
+        // frozen loop: draw every chop boundary and hatch the silent part of each slice
+        if (frozen && nFreeze > 0)
+        {
+            for (int r = 0; r < nFreeze; ++r)
+            {
+                const LiveCutVis::FreezeRegion& reg = vis->freezeRegions[r];
+                const float rs = X(reg.start), re = X(reg.end), rd = X(reg.dutyEnd);
+                const ImVec4 bc = P.blockColor(reg.color);
+                dl->AddLine(ImVec2(rs, ia.y + 4.f * s), ImVec2(rs, ib.y - 4.f * s), U32(bc, 0.7f), 1.f);
+                if (re > rd + 1.f)
+                {
+                    dl->PushClipRect(ImVec2(std::max(rd, ia.x), ia.y), ImVec2(std::min(re, ib.x), ib.y), true);
+                    for (float hx = rd - (ib.y - ia.y); hx < re; hx += 7.f * s)
+                        dl->AddLine(ImVec2(hx, ib.y), ImVec2(hx + (ib.y - ia.y), ia.y), U32(bc, 0.16f), 1.f);
+                    dl->PopClipRect();
+                }
             }
         }
 
@@ -4346,9 +4622,12 @@ protected:
             return;
         }
 
-        LiveCutVis::Phrase tmp;
-        if (vis->readPhrase(tmp))
+        LiveCutVis::Phrase tmp, prevTmp;
+        if (vis->readPhrase(tmp, &prevTmp))
+        {
             phrase = tmp;
+            prevPhrase = prevTmp;
+        }
 
         const int curBlock = vis->currentBlock.load(std::memory_order_relaxed);
         const int curCut = vis->currentCut.load(std::memory_order_relaxed);
@@ -4361,6 +4640,7 @@ protected:
         const int cycleBars = std::max(1, vis->cycleBars.load(std::memory_order_relaxed));
         const int fillBars = vis->fillBars.load(std::memory_order_relaxed);
         const bool dryNow = fillMode && ! fillActive;
+        const bool frozen = vis->frozen.load(std::memory_order_relaxed);
 
         // chips
         {
@@ -4387,10 +4667,14 @@ protected:
             chip(dl, ImVec2(x, y), buf[0] == ' ' ? buf + 1 : buf, playing ? P.b : P.textDim, x);
             if (curBlock >= 0 && curBlock < phrase.numBlocks)
             {
-                std::snprintf(buf, sizeof(buf), trn("%d CUTS", phrase.blocks[curBlock].numCuts), phrase.blocks[curBlock].numCuts);
+                const int cutTotal = frozen ? phrase.numCuts : phrase.blocks[curBlock].numCuts;
+                std::snprintf(buf, sizeof(buf), trn("%d CUTS", cutTotal), cutTotal);
                 chip(dl, ImVec2(x, y), buf, P.blockColor(curBlock), x);
             }
         }
+
+        // freeze tab centred on the LIVE CUTS titlebar, in line with the panel title
+        freezeTab(dl, ImVec2((a.x + b.x) * 0.5f, a.y + 14.f * s + fs(fBold) * 0.5f + 1.f * s));
 
         const float gapY = 10.f * s;
         const float laneH = (ib.y - ia.y - gapY);
@@ -4406,9 +4690,6 @@ protected:
             drawGateSequencer(dl, pa, pb, dryNow);
         else
         {
-            const ZoomButtons zb = zoomButtons("mapzoom", pb, zMap, 1.f, 16.f);
-            const bool viewHot = zoomInput("##mapview", pa, pb, zMap, 1.f, 16.f, false);
-
             const float pad = 10.f * s;
             const float x0 = pa.x + pad, x1 = pb.x - pad;
             const float w = x1 - x0;
@@ -4417,29 +4698,56 @@ protected:
             const float midY = (y0 + y1) * 0.5f;
             const float maxH = (y1 - y0);
 
-            // zoomed: follow the playhead
-            const float viewUnits = total / zMap.time;
-            const float start = zMap.time > 1.001f
-                ? std::max(0.f, std::min(total - viewUnits, unitPos - viewUnits * 0.35f)) : 0.f;
+            // Static two-bar window, matching the output scope below. The phrase length is
+            // randomly 1-4 bars; scaling the map to the whole phrase kept changing its horizontal
+            // scale, which made the same chops look different from one phrase to the next.
+            const float twoBars = 2.f * static_cast<float>(subdiv);
+            const float viewUnits = std::min(static_cast<float>(total), twoBars);
+            const int anchor = frozen ? vis->freezeAnchorUnit.load(std::memory_order_relaxed) : 0;
+            const float wantedStart = (frozen && anchor > 0)
+                ? static_cast<float>(anchor) - viewUnits   // frozen: the exact captured window
+                : unitPos - viewUnits;                     // live: the last two bars
+            // A two-bar window can cross a phrase boundary. When it does, place the previous
+            // phrase to the left of zero so the map still shows what was actually captured.
+            const bool wrapped = frozen && anchor > 0 && viewUnits < static_cast<float>(total) && wantedStart < 0.f;
+            const float start = wrapped ? wantedStart
+                                        : std::max(0.f, std::min(static_cast<float>(total) - viewUnits, wantedStart));
+            const float end = start + viewUnits;
             const float uw = w / viewUnits;
             auto X = [&](float u) { return x0 + (u - start) * uw; };
+
+            struct MapLayer { const LiveCutVis::Phrase* ph; float shift; bool current; };
+            MapLayer layers[2];
+            int layerCount = 0;
+            layers[layerCount++] = { &phrase, 0.f, true };
+            if (wrapped)
+            {
+                if (prevPhrase.totalUnits > 0 && prevPhrase.numBlocks > 0)
+                    layers[layerCount++] = { &prevPhrase, -static_cast<float>(prevPhrase.totalUnits), false };
+                else
+                    layers[layerCount++] = { &phrase, -static_cast<float>(total), false };
+            }
 
             dl->PushClipRect(ImVec2(pa.x + 1.f, pa.y), ImVec2(pb.x - 1.f, pb.y), true);
 
             // ruler
-            const int u0 = std::max(0, static_cast<int>(std::floor(start)));
-            const int u1 = std::min(total, static_cast<int>(std::ceil(start + viewUnits)));
+            const int u0 = static_cast<int>(std::floor(start));
+            const int u1 = static_cast<int>(std::ceil(end));
+            const int barsInPhrase = std::max(1, total / subdiv);
+            auto wrappedBar = [barsInPhrase](int b) {
+                return ((b % barsInPhrase) + barsInPhrase) % barsInPhrase + 1;
+            };
             for (int u = u0; u <= u1; ++u)
             {
                 const float x = X(static_cast<float>(u));
-                const bool bar = (u % subdiv) == 0;
+                const bool bar = ((u % subdiv) + subdiv) % subdiv == 0;
                 if (bar)
                 {
                     dl->AddLine(ImVec2(x, y0 - 2.f * s), ImVec2(x, pb.y - 4.f * s), U32(P.textFaint, 0.45f), 1.f);
-                    if (u < total)
+                    if (u < static_cast<int>(std::ceil(end)))
                     {
                         char bb[16];
-                        std::snprintf(bb, sizeof(bb), "%d", u / subdiv + 1);
+                        std::snprintf(bb, sizeof(bb), "%d", wrappedBar(static_cast<int>(std::floor(static_cast<float>(u) / static_cast<float>(subdiv)))));
                         text(dl, fSmall, ImVec2(x + 4.f * s, pb.y - rulerH - 2.f * s), U32(P.textFaint), bb);
                     }
                 }
@@ -4454,80 +4762,94 @@ protected:
 
             // blocks and cuts
             const float dim = dryNow ? 0.35f : 1.f;
-            for (int bi = 0; bi < phrase.numBlocks; ++bi)
+            for (int li = 0; li < layerCount; ++li)
             {
-                const LiveCutVis::Block& blk = phrase.blocks[bi];
-                const ImVec4 bc = P.blockColor(bi);
-                const float bx0 = X(static_cast<float>(blk.startUnit));
-                const float bx1 = X(static_cast<float>(blk.startUnit + blk.units));
-                if (bx1 < pa.x || bx0 > pb.x)
-                    continue;
-                const bool isCurBlock = bi == curBlock;
-
-                dl->AddRectFilled(ImVec2(bx0 + 1.f, y0), ImVec2(bx1 - 1.f, y1), U32(bc, (isCurBlock ? 0.10f : 0.05f) * dim), 5.f * s);
-                dl->AddRect(ImVec2(bx0 + 1.f, y0), ImVec2(bx1 - 1.f, y1), U32(bc, (isCurBlock ? 0.45f : 0.18f) * dim), 5.f * s, 0, 1.f);
-
-                float cx = bx0;
-                for (int ci = 0; ci < blk.numCuts; ++ci)
+                const MapLayer& layer = layers[li];
+                const LiveCutVis::Phrase& ph = *layer.ph;
+                for (int bi = 0; bi < ph.numBlocks; ++bi)
                 {
-                    const int gi = blk.firstCut + ci;
-                    if (gi < 0 || gi >= phrase.numCuts)
-                        break;
-                    const LiveCutVis::Cut& cut = phrase.cuts[gi];
-                    const float cw = cut.units * uw;
-                    const float h = maxH * (0.30f + 0.62f * std::min(1.f, std::max(0.f, cut.amp)));
-                    const float cy0 = midY - h * 0.5f, cy1 = midY + h * 0.5f;
-                    const float inner = std::min(1.5f * s, cw * 0.15f);
-                    const float dx1 = cx + std::max(1.f, cw * std::min(1.f, std::max(0.f, cut.duty)));
+                    const LiveCutVis::Block& blk = ph.blocks[bi];
+                    const ImVec4 bc = P.blockColor(bi);
+                    const float bu0 = static_cast<float>(blk.startUnit) + layer.shift;
+                    const float bu1 = bu0 + static_cast<float>(blk.units);
+                    if (bu1 < start || bu0 > end)
+                        continue;
+                    const float bx0 = X(bu0);
+                    const float bx1 = X(bu1);
+                    if (bx1 < x0 || bx0 > x1)
+                        continue;
+                    const bool isCurBlock = layer.current && bi == curBlock;
 
-                    const bool isCur = gi == curCut;
-                    const bool past = isCurBlock ? gi < curCut : bi < curBlock;
-                    const float al = (isCur ? 1.f : (past ? 0.62f : 0.28f)) * dim;
+                    dl->AddRectFilled(ImVec2(bx0 + 1.f, y0), ImVec2(bx1 - 1.f, y1), U32(bc, (isCurBlock ? 0.10f : 0.05f) * dim), 5.f * s);
+                    dl->AddRect(ImVec2(bx0 + 1.f, y0), ImVec2(bx1 - 1.f, y1), U32(bc, (isCurBlock ? 0.45f : 0.18f) * dim), 5.f * s, 0, 1.f);
 
-                    if (isCur && ! dryNow)
-                        glow(dl, ImVec2(cx + inner, cy0), ImVec2(cx + cw - inner, cy1), bc, 3.f * s, 1.4f);
+                    float cx = bx0;
+                    for (int ci = 0; ci < blk.numCuts; ++ci)
+                    {
+                        const int gi = blk.firstCut + ci;
+                        if (gi < 0 || gi >= ph.numCuts)
+                            break;
+                        const LiveCutVis::Cut& cut = ph.cuts[gi];
+                        const float cw = cut.units * uw;
+                        const float h = maxH * (0.30f + 0.62f * std::min(1.f, std::max(0.f, cut.amp)));
+                        const float cy0 = midY - h * 0.5f, cy1 = midY + h * 0.5f;
+                        const float inner = std::min(1.5f * s, cw * 0.15f);
+                        const float dx1 = cx + std::max(1.f, cw * std::min(1.f, std::max(0.f, cut.duty)));
 
-                    gradRect(dl, ImVec2(cx + inner, cy0), ImVec2(std::max(cx + inner + 1.f, dx1 - inner), cy1),
-                             withA(mix(bc, P.text, isCur ? 0.25f : 0.f), al), withA(bc, al), 3.f * s);
-                    if (cw * (1.f - cut.duty) > 2.f)
-                        dl->AddRect(ImVec2(dx1 - inner, cy0), ImVec2(cx + cw - inner, cy1), U32(bc, al * 0.6f), 3.f * s, 0, 1.f);
-                    if (isCur)
-                        dl->AddRect(ImVec2(cx + inner, cy0), ImVec2(cx + cw - inner, cy1), U32(P.text, 0.9f * dim), 3.f * s, 0, 1.5f * s);
+                        const bool isCur = layer.current && gi == curCut;
+                        const bool past = ! layer.current || (isCurBlock ? gi < curCut : bi < curBlock);
+                        const float al = (isCur ? 1.f : (past ? 0.62f : 0.28f)) * dim;
 
-                    if (std::fabs(cut.cents) > 1.f && cw > 6.f * s)
-                    {
-                        const float py = midY - (cut.cents / 2400.f) * h * 0.45f;
-                        dl->AddLine(ImVec2(cx + inner + 2.f * s, py), ImVec2(cx + cw - inner - 2.f * s, py),
-                                    U32(P.onAccent, 0.8f * al), 1.5f * s);
+                        if (isCur && ! dryNow)
+                            glow(dl, ImVec2(cx + inner, cy0), ImVec2(cx + cw - inner, cy1), bc, 3.f * s, 1.4f);
+
+                        gradRect(dl, ImVec2(cx + inner, cy0), ImVec2(std::max(cx + inner + 1.f, dx1 - inner), cy1),
+                                 withA(mix(bc, P.text, isCur ? 0.25f : 0.f), al), withA(bc, al), 3.f * s);
+                        if (cw * (1.f - cut.duty) > 2.f)
+                            dl->AddRect(ImVec2(dx1 - inner, cy0), ImVec2(cx + cw - inner, cy1), U32(bc, al * 0.6f), 3.f * s, 0, 1.f);
+                        if (isCur)
+                            dl->AddRect(ImVec2(cx + inner, cy0), ImVec2(cx + cw - inner, cy1), U32(P.text, 0.9f * dim), 3.f * s, 0, 1.5f * s);
+
+                        if (std::fabs(cut.cents) > 1.f && cw > 6.f * s)
+                        {
+                            const float py = midY - (cut.cents / 2400.f) * h * 0.45f;
+                            dl->AddLine(ImVec2(cx + inner + 2.f * s, py), ImVec2(cx + cw - inner - 2.f * s, py),
+                                        U32(P.onAccent, 0.8f * al), 1.5f * s);
+                        }
+                        // reverb throw: ripple in the top-right corner, size by send level
+                        if (cut.verb > 0.001f && cw > 7.f * s)
+                        {
+                            const ImVec2 rc(cx + cw - inner - 5.f * s, cy0 + 5.f * s);
+                            const ImU32 rcol = U32(P.onAccent, 0.95f * std::max(al, 0.4f));
+                            dl->AddCircleFilled(rc, 1.8f * s, rcol, 10);
+                            dl->AddCircle(rc, (2.8f + 2.2f * cut.verb) * s, rcol, 14, 1.f * s);
+                        }
+                        // euclid slice: this cut replays audio from later in the block
+                        if (cut.offset > 0.01f && cw > 14.f * s && blk.kind != kBlockGate) // gate steps play in place
+                        {
+                            char ob[16];
+                            std::snprintf(ob, sizeof(ob), "+%d", static_cast<int>(cut.offset + 0.5f));
+                            text(dl, fSmall, ImVec2(cx + inner + 3.f * s, cy0 + 1.f * s), U32(P.onAccent, 0.9f * al), ob);
+                        }
+                        if (std::fabs(cut.pan) > 0.02f && cw > 8.f * s)
+                        {
+                            const float pxm = cx + cw * 0.5f + cut.pan * (cw * 0.5f - inner - 3.f * s);
+                            dl->AddCircleFilled(ImVec2(pxm, cy1 - 4.f * s), 1.8f * s, U32(P.onAccent, 0.85f * al), 10);
+                        }
+                        cx += cw;
                     }
-                    // reverb throw: ripple in the top-right corner, size by send level
-                    if (cut.verb > 0.001f && cw > 7.f * s)
-                    {
-                        const ImVec2 rc(cx + cw - inner - 5.f * s, cy0 + 5.f * s);
-                        const ImU32 rcol = U32(P.onAccent, 0.95f * std::max(al, 0.4f));
-                        dl->AddCircleFilled(rc, 1.8f * s, rcol, 10);
-                        dl->AddCircle(rc, (2.8f + 2.2f * cut.verb) * s, rcol, 14, 1.f * s);
-                    }
-                    // euclid slice: this cut replays audio from later in the block
-                    if (cut.offset > 0.01f && cw > 14.f * s && blk.kind != kBlockGate) // gate steps play in place
-                    {
-                        char ob[16];
-                        std::snprintf(ob, sizeof(ob), "+%d", static_cast<int>(cut.offset + 0.5f));
-                        text(dl, fSmall, ImVec2(cx + inner + 3.f * s, cy0 + 1.f * s), U32(P.onAccent, 0.9f * al), ob);
-                    }
-                    if (std::fabs(cut.pan) > 0.02f && cw > 8.f * s)
-                    {
-                        const float pxm = cx + cw * 0.5f + cut.pan * (cw * 0.5f - inner - 3.f * s);
-                        dl->AddCircleFilled(ImVec2(pxm, cy1 - 4.f * s), 1.8f * s, U32(P.onAccent, 0.85f * al), 10);
-                    }
-                    cx += cw;
                 }
             }
 
-            // playhead
+            // playhead: when the window wraps, the head near the end of the phrase belongs to the
+            // negative (previous-phrase) half of the view.
             if (phrase.numBlocks > 0)
             {
-                const float px = X(std::min(static_cast<float>(total), unitPos));
+                float head = unitPos;
+                if (wrapped && head > static_cast<float>(anchor) + 0.001f)
+                    head -= static_cast<float>(total);
+                head = std::max(start, std::min(end, head));
+                const float px = X(head);
                 dl->AddLine(ImVec2(px, y0 - 4.f * s), ImVec2(px, y1 + 4.f * s), U32(P.text, 0.9f), 1.5f * s);
                 dl->AddTriangleFilled(ImVec2(px - 5.f * s, y0 - 6.f * s), ImVec2(px + 5.f * s, y0 - 6.f * s),
                                       ImVec2(px, y0), U32(P.text));
@@ -4546,9 +4868,6 @@ protected:
             }
 
             dl->PopClipRect();
-            if (viewHot)
-                zoomHint(dl, pa, pb, false);
-            drawZoomButtons(dl, zb, zMap);
         }
 
         // ===== scrolling output + envelopes =====
@@ -4890,8 +5209,8 @@ protected:
         segmented(dl, LVC_MINCUT, mincut, 3, ImVec2(x0, y), ImVec2(x1, y + 26.f * s));
         y += 26.f * s + 16.f * s;
 
-        rangeKnob(dl, LVC_MINPHRS, LVC_MAXPHRS, "PHRASE (BARS)", ImVec2(x0, y), w);
-        y += 64.f * s;
+        rangeSlider(dl, LVC_MINPHRS, LVC_MAXPHRS, "PHRASE (BARS)", ImVec2(x0, y), w);
+        y += 56.f * s;
 
         // ---- fill mode ----
         dl->AddLine(ImVec2(x0, y + 2.f * s), ImVec2(x1, y + 2.f * s), U32(P.panelBorder), 1.f);
@@ -5991,18 +6310,18 @@ protected:
         rangeKnob(dl, LVC_HPFREQ, LVC_HPMAX, "HIGHPASS", ImVec2(x0 + cw2, y), cw2, false, on, rr, true);
         y += rr * 2.f + 13.f * s + fs(fSmall) * 1.7f + 10.f * s;
         // resonance and its new saturation control share the row above the response graph
-        const float r = 15.f * s;
+        const float r = 14.f * s;
         knob(dl, LVC_RESO, "RESO", ImVec2(x0 + cw2 * 0.5f, y + r + 6.f * s), r, on, false, cw2);
         knob(dl, LVC_FILTERDRIVE, "DRIVE", ImVec2(x0 + cw2 * 1.5f, y + r + 6.f * s), r, on, false, cw2);
         if (ImGui::IsItemHovered())
             tooltip("Overdrive the signal before the filter. Low levels gain harmonics while full-scale peaks stay near their original level.");
-        y += r * 2.f + 38.f * s;
+        y += r * 2.f + 36.f * s;
 
         float bits = 0.f, rate = 0.f, lp = 0.f, hp = 0.f;
         readFxScope(bits, rate, lp, hp);
         fxViewLP += (lp - fxViewLP) * 0.3f;
         fxViewHP += (hp - fxViewHP) * 0.3f;
-        const float ih = std::min(140.f * s, std::max(48.f * s, b.y - 14.f * s - y - 4.f * s));
+        const float ih = std::max(60.f * s, std::min(140.f * s, b.y - 14.f * s - y - 8.f * s));
         drawFilterResponse(dl, x0, x1, b.y - 14.f * s - ih, b.y - 14.f * s, on);
     }
 
@@ -6019,7 +6338,7 @@ protected:
         const float cw2 = w * 0.5f, rr = 12.f * s;
         rangeKnob(dl, LVC_MINBITS, LVC_MAXBITS, "BITS", ImVec2(x0, y), cw2, false, on, rr, true);
         rangeKnob(dl, LVC_MINFREQ, LVC_MAXFREQ, "RATE", ImVec2(x0 + cw2, y), cw2, false, on, rr, true);
-        y += rr * 2.f + 13.f * s + fs(fSmall) * 1.7f + 8.f * s;
+        y += rr * 2.f + 13.f * s + fs(fSmall) * 1.7f + 10.f * s;
 
         // post-processing: blend the crushed signal with the dry one, then tame its digital edges
         const float r = 14.f * s;
@@ -6029,15 +6348,14 @@ protected:
         knob(dl, LVC_CRUSHLP, "POST LP", ImVec2(x0 + cw2 * 1.5f, y + r + 6.f * s), r, on, false, cw2);
         if (ImGui::IsItemHovered())
             tooltip("Lowpass after the bit and sample-rate reduction. Fully open leaves the crusher untouched.");
-        y += r * 2.f + 34.f * s;
+        y += r * 2.f + 36.f * s;
 
         float bits = 0.f, rate = 0.f, lp = 0.f, hp = 0.f;
         readFxScope(bits, rate, lp, hp);
         fxViewBits += (bits - fxViewBits) * 0.35f;
         fxViewRate += (rate - fxViewRate) * 0.35f;
-        const float ih = std::max(60.f * s, b.y - 14.f * s - y - 8.f * s);
-        if (ih > 40.f * s)
-            drawCrushScope(dl, x0, x1, b.y - 14.f * s - ih, b.y - 14.f * s, on);
+        const float ih = std::max(60.f * s, std::min(140.f * s, b.y - 14.f * s - y - 8.f * s));
+        drawCrushScope(dl, x0, x1, b.y - 14.f * s - ih, b.y - 14.f * s, on);
     }
 
     // delay module, ECHO mode: stereo mode, time (note values or ms), feedback / mix / tone
@@ -6166,11 +6484,16 @@ protected:
             tooltip("Tune: each slice's comb delay snaps to a note of the pitchmap's key and scale,\n"
                     "so the comb rings in key (FB rings the most). Set the scale in SPECTRAL PITCHMAP.");
         y += 52.f * s;
-        rangeKnob(dl, LVC_MINDELAY, LVC_MAXDELAY, "TIME", ImVec2(x0, y), w, false, on);
-        y += 64.f * s;
-        rangeKnob(dl, LVC_MINFEEDBACK, LVC_FEEDBACK, "FEEDBACK", ImVec2(x0, y), w, false, on);
-        y += 64.f * s;
-        rangeKnob(dl, LVC_MINDLYMIX, LVC_DLYMIX, sendRoute ? "SEND" : "DRY / WET", ImVec2(x0, y), w, false, on);
+        // TIME owns a row of its own: a big, centred range knob is the comb's main control
+        const float timeR = 24.f * s;
+        rangeKnob(dl, LVC_MINDELAY, LVC_MAXDELAY, "TIME", ImVec2(x0, y), w, false, on, timeR);
+        y += 2.f * timeR + 13.f * s + fs(fSmall) * 2.1f + 4.f * s;
+        // FEEDBACK and DRY / WET share the smaller row underneath
+        const float halfW = (w - 8.f * s) * 0.5f;
+        const float smallR = 11.f * s;
+        rangeKnob(dl, LVC_MINFEEDBACK, LVC_FEEDBACK, "FEEDBACK", ImVec2(x0, y), halfW, false, on, smallR, true);
+        rangeKnob(dl, LVC_MINDLYMIX, LVC_DLYMIX, sendRoute ? "SEND" : "DRY / WET",
+                  ImVec2(x0 + halfW + 8.f * s, y), halfW, false, on, smallR, true);
     }
 
     // ---- antialiased band: filled strip (per-vertex colour) between two contours ----
@@ -6900,23 +7223,105 @@ protected:
         }
     }
 
+    // Small line icons for the signal-flow blocks. The row uses the effect ids; fixed stages use their own range.
+    static constexpr int kFlowIconIn = 100, kFlowIconDryWet = 101, kFlowIconFilters = 102,
+                         kFlowIconLimit = 103, kFlowIconOut = 104;
+
+    void drawFlowIcon(ImDrawList* dl, int kind, ImVec2 c, float r, ImU32 col)
+    {
+        const float th = std::max(1.f, 1.25f * s);
+        auto pt = [&](float x, float y) { return ImVec2(c.x + x * r, c.y + y * r); };
+        auto line = [&](ImVec2 p, ImVec2 q) { dl->AddLine(p, q, col, th); };
+
+        switch (kind)
+        {
+            case kFxCrusher: // quantised staircase
+            {
+                const ImVec2 p[6] = { pt(-0.9f, 0.6f), pt(-0.3f, 0.6f), pt(-0.3f, 0.1f),
+                                      pt(0.3f, 0.1f), pt(0.3f, -0.5f), pt(0.9f, -0.5f) };
+                dl->AddPolyline(p, 6, col, 0, th);
+                break;
+            }
+            case kFxComb: // decaying echo taps
+                for (int k = 0; k < 3; ++k)
+                {
+                    const float x = (k - 1.f) * 0.6f, hh = 0.8f - 0.22f * k;
+                    line(pt(x, -hh), pt(x, 0.7f));
+                }
+                break;
+            case kFxFilter: // lowpass/highpass slope
+            {
+                const ImVec2 p[4] = { pt(-0.9f, 0.6f), pt(-0.35f, 0.6f), pt(0.25f, -0.6f), pt(0.9f, -0.6f) };
+                dl->AddPolyline(p, 4, col, 0, th);
+                break;
+            }
+            case kFxVerb: // ripples
+                for (int k = 0; k < 3; ++k)
+                    dl->AddCircle(c, r * (0.3f + 0.3f * k), col, 16, th);
+                break;
+            case kFxChroma: // note head, stem and flag
+                dl->AddCircleFilled(pt(-0.35f, 0.45f), r * 0.28f, col, 10);
+                line(pt(-0.07f, 0.45f), pt(-0.07f, -0.75f));
+                line(pt(-0.07f, -0.75f), pt(0.55f, -0.5f));
+                break;
+            case kRouteSlice: // scissors
+                line(pt(-0.7f, -0.6f), pt(0.7f, 0.6f));
+                line(pt(-0.7f, 0.6f), pt(0.7f, -0.6f));
+                dl->AddCircle(pt(-0.7f, -0.6f), r * 0.18f, col, 8, th);
+                dl->AddCircle(pt(-0.7f, 0.6f), r * 0.18f, col, 8, th);
+                break;
+            case kFxTransient: // sharp attack over a flat body
+            {
+                const ImVec2 p[5] = { pt(-0.9f, 0.55f), pt(-0.25f, 0.45f), pt(0.05f, -0.8f),
+                                      pt(0.35f, 0.5f), pt(0.9f, 0.55f) };
+                dl->AddPolyline(p, 5, col, 0, th);
+                break;
+            }
+            case kFlowIconIn:
+            case kFlowIconOut:
+                line(pt(-0.8f, 0.f), pt(0.45f, 0.f));
+                dl->AddTriangleFilled(pt(0.85f, 0.f), pt(0.35f, -0.4f), pt(0.35f, 0.4f), col);
+                break;
+            case kFlowIconDryWet: // dry/wet split
+                line(pt(-0.9f, 0.f), pt(-0.1f, 0.f));
+                line(pt(-0.1f, 0.f), pt(0.8f, -0.6f));
+                line(pt(-0.1f, 0.f), pt(0.8f, 0.6f));
+                break;
+            case kFlowIconFilters: // crossed high/low curves
+                line(pt(-0.9f, 0.55f), pt(-0.1f, 0.55f));
+                line(pt(-0.1f, 0.55f), pt(0.9f, -0.55f));
+                line(pt(-0.9f, -0.55f), pt(0.1f, -0.55f));
+                line(pt(0.1f, -0.55f), pt(0.9f, 0.55f));
+                break;
+            case kFlowIconLimit: // ceiling between two posts
+                line(pt(-0.9f, -0.55f), pt(0.9f, -0.55f));
+                line(pt(-0.55f, -0.55f), pt(-0.55f, 0.65f));
+                line(pt(0.55f, -0.55f), pt(0.55f, 0.65f));
+                line(pt(-0.9f, 0.65f), pt(0.9f, 0.65f));
+                break;
+        }
+    }
+
     // Bottom signal-flow ribbon. The slicer and the five effects form one row that can be put in any order by dragging
-    // (LVC_ROUTE); effects in front of the slicer process what it records. A click on SLICE, without dragging, switches
-    // the slicer on / off. IN and the stages after the row are shown for context only.
+    // (LVC_ROUTE); effects in front of the slicer process what it records. A click on any row block, without dragging,
+    // switches that module on / off. IN and the stages after the row are shown for context, with the limiter toggleable.
     void drawSignalFlow(ImDrawList* dl, ImVec2 a, ImVec2 b)
     {
         static constexpr int kSlice = kRouteSlice;    // id of the slicer block in the movable row
         static constexpr int kRow = kFlowItems;       // slicer + four effects + pitchmap + transient shaper
         inset(dl, a, b, 8.f * s);
         text(dl, fSmall, ImVec2(a.x + 10.f * s, a.y + 3.f * s), U32(P.textFaint),
-             "SIGNAL FLOW   \xc2\xb7   DRAG ANY BLOCK TO REORDER (EFFECTS BEFORE SLICE PROCESS WHAT IT RECORDS)   \xc2\xb7   CLICK SLICE TO SWITCH THE SLICER");
+             "SIGNAL FLOW   \xc2\xb7   DRAG ANY BLOCK TO REORDER (EFFECTS BEFORE SLICE PROCESS WHAT IT RECORDS)   \xc2\xb7   CLICK A BLOCK TO SWITCH IT ON / OFF");
 
         int order[kRow];
         flowFromParams(pv, order);
         static const char* const names[kRow] = { "CRUSH", "DELAY", "FILTER", "REVERB", "PITCHMAP", "SLICE", "TRANSIENT" };
+        static constexpr uint32_t toggleParam[kRow] = {
+            LVC_CRUSHER, LVC_COMB, LVC_FILTER, LVC_REVERB, LVC_CHROMA, LVC_SLICER, LVC_TRANSIENT
+        };
         const bool on[kRow] = {
             pv[LVC_CRUSHER] > 0.5f, pv[LVC_COMB] > 0.5f, pv[LVC_FILTER] > 0.5f, pv[LVC_REVERB] > 0.5f,
-            pv[LVC_CHROMA] > 0.5f, true, pv[LVC_TRANSIENT] > 0.5f
+            pv[LVC_CHROMA] > 0.5f, pv[LVC_SLICER] > 0.5f, pv[LVC_TRANSIENT] > 0.5f
         };
 
         const int n = kRow + 5; // IN, the movable row, DRY/WET, HP/LP, LIMIT, OUT
@@ -6952,7 +7357,15 @@ protected:
         for (int e = 0; e < kRow; ++e)
             if (ImRect(fxX[e] - bw * 0.5f, y0, fxX[e] + bw * 0.5f, y1).Contains(io.MousePos))
                 hoverFx = e;
+        int hoverTail = -1;
+        for (int i = kRow + 1; i < n; ++i)
+            if (ImRect(slotX(i) - bw * 0.5f, y0, slotX(i) + bw * 0.5f, y1).Contains(io.MousePos))
+                hoverTail = i;
         const bool hoverSlice = dragFx < 0 && hoverFx == kSlice;
+
+        // the tail's limiter is the only fixed stage with a simple on/off switch
+        if (dragFx < 0 && hoverTail == kRow + 3 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            setParamGesture(LVC_LIMITER, pv[LVC_LIMITER] > 0.5f ? 0.f : 1.f);
 
         if (dragFx < 0 && hoverFx >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
         {
@@ -7005,8 +7418,12 @@ protected:
                     setParamGesture(LVC_ROUTE, static_cast<float>(encodePerm(six, kRouteItems)));
                     setParamGesture(LVC_TRPOS, static_cast<float>(tp));
                 }
-                else if (dragFx == kSlice)
-                    setParamGesture(LVC_SLICER, pv[LVC_SLICER] > 0.5f ? 0.f : 1.f); // a click on SLICE
+                else
+                {
+                    // a click without a drag toggles whichever module was pressed
+                    const uint32_t p = toggleParam[dragFx];
+                    setParamGesture(p, pv[p] > 0.5f ? 0.f : 1.f);
+                }
                 dragFx = -1;
             }
         }
@@ -7043,19 +7460,20 @@ protected:
             const bool inRow = i >= 1 && i <= kRow;
             const int id = inRow ? shown[i - 1] : -1;
             const bool isFx = inRow && id != kSlice;
-            const bool enabled = isFx ? on[id] : (id == kSlice ? pv[LVC_SLICER] > 0.5f : true);
+            const bool isLimiter = i == kRow + 3;
+            const bool enabled = inRow ? on[id] : (isLimiter ? pv[LVC_LIMITER] > 0.5f : true);
             const float alpha = enabled ? 1.f : 0.42f;
             const float cx = centerX(i);
             const ImRect r(cx - bw * 0.5f, y0, cx + bw * 0.5f, y1);
-            const bool isHover = isFx && hoverFx == id && dragFx < 0;
+            const bool isHover = dragFx < 0 && (inRow ? hoverFx == id : hoverTail == i);
             const bool isHeld = isFx && dragFx == id;
 
             ImU32 fill = U32(P.track, 0.75f);
             if (isFx) fill = U32(mix(P.a, P.b, 0.5f), 0.12f * alpha);
             dl->AddRectFilled(r.Min, r.Max, fill, 6.f * s);
 
-            // only active (enabled) effects get an outline; fixed and disabled stages do not
-            if (isFx && enabled)
+            // enabled effects (and the limiter) get an outline; disabled stages are dimmed instead
+            if ((isFx || isLimiter) && enabled)
             {
                 const ImVec4 edge = isHeld ? P.c : (isHover ? P.b : mix(P.a, P.b, 0.5f));
                 dl->AddRect(r.Min, r.Max, U32(edge, (isHeld || isHover) ? 1.f : 0.75f),
@@ -7063,20 +7481,28 @@ protected:
             }
 
             const char* label = inRow ? names[id] : (i == 0 ? "IN" : tailNames[i - kRow - 1]);
-            textCentered(dl, fBold, r.GetCenter(), U32(enabled ? P.text : P.textDim, alpha), label);
+            const int iconKind = inRow ? id
+                                       : (i == 0 ? kFlowIconIn : kFlowIconDryWet + (i - kRow - 1));
+            const ImU32 ink = U32(enabled ? (isHover ? P.b : P.text) : P.textDim, alpha);
+            const float iconR = 5.f * s;
+            const float gap = 3.f * s;
+            const float labelW = textSize(fSmall, label).x;
+            const float groupW = iconR * 2.f + gap + labelW;
+            const float groupX = cx - groupW * 0.5f;
+            drawFlowIcon(dl, iconKind, ImVec2(groupX + iconR, r.GetCenter().y), iconR, ink);
+            text(dl, fSmall, ImVec2(groupX + iconR * 2.f + gap, r.GetCenter().y - fs(fSmall) * 0.5f), ink, label);
 
-            if (id == kSlice && ! enabled)
-                textCentered(dl, fSmall, ImVec2(cx, r.Max.y - 7.f * s), U32(P.textDim, 0.85f), "OFF");
             if (id == kSlice && (hoverSlice || dragFx == kSlice))
                 dl->AddRect(r.Min, r.Max, U32(dragFx == kSlice ? P.c : P.b), 6.f * s, 0, 2.f * s);
         }
 
-        if (hoverSlice)
-            tooltip(pv[LVC_SLICER] > 0.5f ? "Drag to move the slicer in the chain, click to switch it off"
-                                                    : "Drag to move the slicer in the chain, click to switch it on");
-        else if (hoverFx >= 0 && dragFx < 0)
-            tooltip("Drag to move it anywhere in the chain (before SLICE it processes what the slicer records)");
-        if (dragFx >= 0 || hoverFx >= 0)
+        if (hoverFx >= 0 && dragFx < 0)
+            tooltip("%s: click to switch it %s, drag to reorder the chain\n"
+                    "Before SLICE, effects process what the slicer records.",
+                    names[hoverFx], on[hoverFx] ? "off" : "on");
+        else if (hoverTail == kRow + 3 && dragFx < 0)
+            tooltip("LIMIT: click to switch the limiter %s", pv[LVC_LIMITER] > 0.5f ? "off" : "on");
+        if (dragFx >= 0 || hoverFx >= 0 || hoverTail == kRow + 3)
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     }
 
@@ -7124,6 +7550,328 @@ protected:
             dl->AddLine(ImVec2(W - 4.f * s - o, H - 4.f * s), ImVec2(W - 4.f * s, H - 4.f * s - o), col, 1.5f * s);
         }
     }
+
+    // Fallback for OpenGL 3 / GLES hosts, which cannot use the fixed-function texture compositor below.
+    void drawFrozenFallback(ImDrawList* dl, float W, float H)
+    {
+        const ImVec4 ice = P.dark ? hex(0x9EE3FF) : hex(0x2E86B7);
+        const float strong = P.dark ? 0.11f : 0.065f;
+        const float soft   = P.dark ? 0.035f : 0.02f;
+
+        dl->AddRectFilledMultiColor(ImVec2(0.f, 0.f), ImVec2(W, H),
+                                    U32(ice, strong), U32(ice, soft),
+                                    U32(ice, strong), U32(ice, soft));
+        for (int i = 0; i < 4; ++i)
+        {
+            const float g = i * 5.f * s;
+            dl->AddRect(ImVec2(g, g), ImVec2(W - g, H - g), U32(ice, 0.10f - i * 0.02f), 18.f * s, 0, 1.f);
+        }
+
+        for (int i = 0; i < 96; ++i)
+        {
+            const uint32_t h1 = uint32_t(i + 1) * 2654435761u;
+            const uint32_t h2 = h1 ^ 0x9E3779B9u;
+            const float fx = static_cast<float>((h1 >> 9) & 0xFFFF) / 65535.f;
+            const float fy = static_cast<float>((h2 >> 9) & 0xFFFF) / 65535.f;
+            const float fr = static_cast<float>((h1 >> 25) & 0x7F) / 127.f;
+            const ImVec2 p(fx * W, fy * H);
+            const float r = (0.5f + 1.4f * fr) * s;
+            dl->AddCircleFilled(p, r, U32(ice, 0.05f + 0.07f * fr), 6);
+            if (fr > 0.72f)
+                dl->AddLine(ImVec2(p.x - r * 2.f, p.y), ImVec2(p.x + r * 2.f, p.y), U32(ice, 0.05f), 1.f);
+        }
+
+        drawSnowflake(dl, ImVec2(30.f * s, 30.f * s), 14.f * s, U32(ice, 0.30f), 1.f);
+        drawSnowflake(dl, ImVec2(W - 30.f * s, 30.f * s), 14.f * s, U32(ice, 0.30f), 1.f);
+        drawSnowflake(dl, ImVec2(30.f * s, H - 30.f * s), 14.f * s, U32(ice, 0.30f), 1.f);
+        drawSnowflake(dl, ImVec2(W - 30.f * s, H - 30.f * s), 14.f * s, U32(ice, 0.30f), 1.f);
+    }
+
+#if !defined(DGL_USE_GLES2) && !defined(DGL_USE_GLES3) && !defined(DGL_USE_OPENGL3)
+    // Runs inside ImGui's OpenGL renderer, after the whole frame has been drawn.
+    static void frozenCallback(const ImDrawList*, const ImDrawCmd* cmd)
+    {
+        static_cast<HyperCutUI*>(cmd->UserCallbackData)->frozenApply();
+    }
+
+    // Periodic value-noise + Voronoi crystal edges. Both maps tile seamlessly, so the frost
+    // can be scaled to the window without stretching or revealing a seam.
+    void frostBuildTextures()
+    {
+        constexpr int N = 512;
+        std::vector<uint8_t> base(N * N * 4), vein(N * N * 4);
+
+        auto hash2 = [](int x, int y) -> float
+        {
+            uint32_t h = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(y) * 668265263u;
+            h = (h ^ (h >> 13)) * 1274126177u;
+            return static_cast<float>((h ^ (h >> 16)) & 0xFFFFu) / 65535.f;
+        };
+        auto wrap = [](int v, int period) -> int
+        {
+            const int r = v % period;
+            return r < 0 ? r + period : r;
+        };
+        auto smooth = [](float t) -> float
+        {
+            t = std::max(0.f, std::min(1.f, t));
+            return t * t * (3.f - 2.f * t);
+        };
+        auto vnoise = [&](float x, float y, int period) -> float
+        {
+            const int xi = static_cast<int>(std::floor(x));
+            const int yi = static_cast<int>(std::floor(y));
+            const float fx = x - static_cast<float>(xi), fy = y - static_cast<float>(yi);
+            const float u = smooth(fx), v = smooth(fy);
+            const float a = hash2(wrap(xi, period),     wrap(yi, period));
+            const float b = hash2(wrap(xi + 1, period), wrap(yi, period));
+            const float c = hash2(wrap(xi, period),     wrap(yi + 1, period));
+            const float d = hash2(wrap(xi + 1, period), wrap(yi + 1, period));
+            const float top = a + (b - a) * u, bot = c + (d - c) * u;
+            return top + (bot - top) * v;
+        };
+        auto fbm = [&](float u, float v, int freq) -> float
+        {
+            float sum = 0.f, amp = 0.5f, norm = 0.f;
+            for (int o = 0; o < 4; ++o)
+            {
+                const int f = freq << o;
+                sum += amp * vnoise(u * static_cast<float>(f), v * static_cast<float>(f), f);
+                norm += amp;
+                amp *= 0.5f;
+            }
+            return sum / norm;
+        };
+        auto worley = [&](float u, float v, int cells, float& f1, float& f2)
+        {
+            const float gx = u * static_cast<float>(cells), gy = v * static_cast<float>(cells);
+            const int ix = static_cast<int>(std::floor(gx)), iy = static_cast<int>(std::floor(gy));
+            f1 = f2 = 10.f;
+            for (int oy = -1; oy <= 1; ++oy)
+                for (int ox = -1; ox <= 1; ++ox)
+                {
+                    const int cx = ix + ox, cy = iy + oy;
+                    const float px = static_cast<float>(cx) + hash2(wrap(cx, cells), wrap(cy, cells));
+                    const float py = static_cast<float>(cy) + hash2(wrap(cx + 17, cells), wrap(cy + 31, cells));
+                    const float dx = px - gx, dy = py - gy;
+                    const float d = dx * dx + dy * dy;
+                    if (d < f1) { f2 = f1; f1 = d; }
+                    else if (d < f2) f2 = d;
+                }
+            f1 = std::sqrt(f1);
+            f2 = std::sqrt(f2);
+        };
+        // Sparse condensation beads: bright rims with a slightly darker centre.
+        auto droplets = [&](float u, float v, int cells) -> float
+        {
+            const float gx = u * static_cast<float>(cells), gy = v * static_cast<float>(cells);
+            const int ix = static_cast<int>(std::floor(gx)), iy = static_cast<int>(std::floor(gy));
+            float sum = 0.f;
+            for (int oy = -1; oy <= 1; ++oy)
+                for (int ox = -1; ox <= 1; ++ox)
+                {
+                    const int cx = ix + ox, cy = iy + oy;
+                    const int wx = wrap(cx, cells), wy = wrap(cy, cells);
+                    if (hash2(wx + 53, wy + 97) < 0.46f)
+                        continue;
+                    const float px = static_cast<float>(cx) + hash2(wx + 5, wy + 19);
+                    const float py = static_cast<float>(cy) + hash2(wx + 29, wy + 7);
+                    const float rr = 0.10f + 0.13f * hash2(wx + 11, wy + 41);
+                    const float dx = px - gx, dy = py - gy;
+                    const float d = std::sqrt(dx * dx + dy * dy);
+                    const float rim = std::exp(-std::pow((d - rr) / 0.035f, 2.f));
+                    const float core = std::exp(-std::pow(d / (rr * 0.72f), 2.f));
+                    sum += rim * 0.42f + core * 0.18f;
+                }
+            return std::min(1.f, sum);
+        };
+
+        for (int y = 0; y < N; ++y)
+            for (int x = 0; x < N; ++x)
+            {
+                const float u = (static_cast<float>(x) + 0.5f) / N;
+                const float v = (static_cast<float>(y) + 0.5f) / N;
+
+                // Domain-warped coordinates give the crystal edges a feathery, uneven shape
+                // instead of the regular polygons a plain Voronoi diagram produces.
+                const float wu = u + (fbm(u + 0.13f, v + 0.71f, 5) - 0.5f) * 0.045f;
+                const float wv = v + (fbm(u + 0.67f, v + 0.23f, 5) - 0.5f) * 0.045f;
+                const float cloud = fbm(wu, wv, 3);
+                const float fine = fbm(wu + 0.37f, wv + 0.11f, 10);
+                float f1, f2;
+                worley(wu, wv, 7, f1, f2);
+
+                const float edge = 1.f - smooth((f2 - f1 - 0.010f) / 0.085f);
+                const float ridge = std::pow(1.f - std::fabs(2.f * fine - 1.f), 6.f);
+                const float body = smooth((cloud - 0.38f) / 0.40f) * 0.42f;
+                const float drop = droplets(u, v, 13);
+                const float veins = edge * (0.30f + 0.70f * fine) + ridge * 0.38f;
+                const float density = std::max(0.f, std::min(1.f, 0.04f + body + veins * 0.42f + drop * 0.18f));
+                const float sparks = std::max(0.f, std::min(1.f,
+                    edge * (0.35f + 0.65f * fine) * 0.75f + ridge * 0.30f + drop * 0.65f));
+
+                const uint8_t db = static_cast<uint8_t>(density * 255.f);
+                const uint8_t vb = static_cast<uint8_t>(sparks * 255.f);
+                const int i = (y * N + x) * 4;
+                for (int c = 0; c < 4; ++c) { base[i + c] = db; vein[i + c] = vb; }
+            }
+
+        auto upload = [N](const std::vector<uint8_t>& px) -> GLuint
+        {
+            GLuint tex = 0;
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, N, N, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+            return tex;
+        };
+        frostBaseTex = upload(base);
+        frostVeinTex = upload(vein);
+    }
+
+    enum FrostLayer { kFrostTint, kFrostGlow, kFrostSpark };
+
+    // Frost gathers at the window edges and corners. The middle stays almost clear so text and
+    // controls remain readable; this is the main reason the earlier full-strength wash felt fake.
+    static float frostEdge(float x, float y, float W, float H)
+    {
+        const float dx = std::min(x, W - x) / std::max(1.f, W * 0.22f);
+        const float dy = std::min(y, H - y) / std::max(1.f, H * 0.24f);
+        const float d = std::max(0.f, std::min(1.f, std::min(dx, dy)));
+        return 1.f - d * d * (3.f - 2.f * d);
+    }
+
+    void frostQuad(float W, float H, float tile, float u0, float v0,
+                   FrostLayer layer, const ImVec4& col, float amount)
+    {
+        constexpr int nx = 24, ny = 14;
+        const float us = W / std::max(1.f, tile), vs = H / std::max(1.f, tile);
+
+        auto vert = [&](int i, int j)
+        {
+            const float x = W * static_cast<float>(i) / nx;
+            const float y = H * static_cast<float>(j) / ny;
+            const float e = frostEdge(x, y, W, H);
+            if (layer == kFrostTint)
+            {
+                // Primary colour becomes the tint itself: white in the middle, cool at the rim.
+                const float t = e * amount;
+                glColor4f(1.f + (col.x - 1.f) * t,
+                          1.f + (col.y - 1.f) * t,
+                          1.f + (col.z - 1.f) * t, 1.f);
+            }
+            else
+            {
+                const float k = amount * (0.10f + 0.90f * e);
+                glColor4f(col.x * k, col.y * k, col.z * k, 1.f);
+            }
+            glTexCoord2f(u0 + us * static_cast<float>(i) / nx,
+                         v0 + vs * static_cast<float>(j) / ny);
+            glVertex2f(x, y);
+        };
+
+        glBegin(GL_QUADS);
+        for (int j = 0; j < ny; ++j)
+            for (int i = 0; i < nx; ++i)
+            {
+                vert(i, j); vert(i + 1, j); vert(i + 1, j + 1); vert(i, j + 1);
+            }
+        glEnd();
+    }
+
+    void frostPlainQuad(float W, float H)
+    {
+        glBegin(GL_QUADS);
+        glVertex2f(0.f, 0.f);
+        glVertex2f(W,   0.f);
+        glVertex2f(W,   H);
+        glVertex2f(0.f, H);
+        glEnd();
+    }
+
+    void frozenApply()
+    {
+        if (frostBaseTex == 0 || frostVeinTex == 0)
+            frostBuildTextures();
+
+        const ImGuiIO& io = ImGui::GetIO();
+        const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+
+        glDisable(GL_SCISSOR_TEST);
+        glEnable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+
+        // 0. a stronger, uniform cool blue colour grade. This carries the "frozen" mood without
+        //    relying on texture strength, so the texture itself can stay subtle.
+        const ImVec4 grade = P.dark ? hex(0xA8C8F0) : hex(0xB9D7F3);
+        glDisable(GL_TEXTURE_2D);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        glColor4f(grade.x, grade.y, grade.z, 1.f);
+        glBlendFunc(GL_DST_COLOR, GL_ZERO);
+        frostPlainQuad(W, H);
+        glEnable(GL_TEXTURE_2D);
+
+        // 1. cool multiply, weighted toward the rim. GL_CONSTANT supplies white; the per-vertex
+        //    primary colour supplies the local tint, so the centre is left untouched.
+        const ImVec4 tint = P.dark ? hex(0x8FC6E2) : hex(0x9BCBE3);
+        const GLfloat white[4] = { 1.f, 1.f, 1.f, 1.f };
+        glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, white);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_INTERPOLATE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_RGB, GL_CONSTANT);
+        glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_RGB, GL_SRC_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE1_RGB, GL_PRIMARY_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND1_RGB, GL_SRC_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE2_RGB, GL_TEXTURE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND2_RGB, GL_SRC_ALPHA);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_ALPHA, GL_PRIMARY_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_ALPHA, GL_SRC_ALPHA);
+        glBlendFunc(GL_DST_COLOR, GL_ZERO);
+        glBindTexture(GL_TEXTURE_2D, frostBaseTex);
+        frostQuad(W, H, 520.f * s, 0.13f, 0.47f, kFrostTint, tint, 0.397f);
+
+        // 2. pale ice screen, with only a trace in the middle so controls stay legible.
+        const ImVec4 ice = P.dark ? hex(0xD4F2FF) : hex(0xA9E2F7);
+        const float screenAmt = P.dark ? 0.109f : 0.048f;
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_MODULATE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_RGB, GL_TEXTURE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_RGB, GL_SRC_ALPHA);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE1_RGB, GL_PRIMARY_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND1_RGB, GL_SRC_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_ALPHA, GL_PRIMARY_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_ALPHA, GL_SRC_ALPHA);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR);
+        frostQuad(W, H, 430.f * s, 0.61f, 0.23f, kFrostGlow, ice, screenAmt);
+
+        // 3. additive crystal/bead highlights, mostly in the corners and along the rim.
+        const float sparkAmt = P.dark ? 0.064f : 0.035f;
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_MODULATE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_RGB, GL_TEXTURE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_RGB, GL_SRC_ALPHA);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE1_RGB, GL_PRIMARY_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND1_RGB, GL_SRC_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_ALPHA, GL_PRIMARY_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_ALPHA, GL_SRC_ALPHA);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glBindTexture(GL_TEXTURE_2D, frostVeinTex);
+        frostQuad(W, H, 270.f * s, 0.29f, 0.83f, kFrostSpark, hex(0xE8F9FF), sparkAmt);
+
+        // Leave the renderer in its normal state; the ResetRenderState callback does the same.
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glEnable(GL_SCISSOR_TEST);
+    }
+#endif
 
     void saveSize()
     {
@@ -7451,6 +8199,19 @@ protected:
         }
         ImGui::End();
         ImGui::PopStyleVar(2);
+
+        // Whole-window freeze pass. Uses the foreground draw list so it lands on top of tooltips
+        // and popups too; the legacy GL path composites real procedural textures in a blend mix.
+        if (pv[LVC_FREEZE] > 0.5f)
+        {
+            ImDrawList* fg = ImGui::GetForegroundDrawList();
+           #if defined(DGL_USE_GLES2) || defined(DGL_USE_GLES3) || defined(DGL_USE_OPENGL3)
+            drawFrozenFallback(fg, WFull, H);
+           #else
+            fg->AddCallback(&HyperCutUI::frozenCallback, this);
+            fg->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+           #endif
+        }
 
         // everything changed from the UI this frame becomes an undo step once the mouse is released
         commitUndo();

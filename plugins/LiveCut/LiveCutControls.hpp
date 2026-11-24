@@ -191,7 +191,9 @@ enum LiveCutControls{
     LVC_CRUSHLP       = 147, // crusher post lowpass, Hz (20000 = bypassed)
     // Appended so existing sessions keep their parameter ids. Bit i = the note i semitones above LVC_CHKEY.
     LVC_CHCUSTOM      = 148, // custom pitch classes of the pitchmap scale (used when LVC_CHSCALE = Custom)
-    LVC_CONTROL_NR    = 149
+    // Freeze: loop the chops currently in the capture buffer instead of choosing new random cuts.
+    LVC_FREEZE        = 149,
+    LVC_CONTROL_NR    = 150
 };
 
 static const std::array<std::pair<float, float>, LVC_CONTROL_NR> controlLimits =
@@ -344,7 +346,8 @@ static const std::array<std::pair<float, float>, LVC_CONTROL_NR> controlLimits =
     {0.0f, 1.0f},        // LVC_FILTERDRIVE
     {0.0f, 1.0f},        // LVC_CRUSHMIX
     {20.0f, 20000.0f},   // LVC_CRUSHLP
-    {0.0f, 4095.0f}      // LVC_CHCUSTOM (12 pitch classes)
+    {0.0f, 4095.0f},     // LVC_CHCUSTOM (12 pitch classes)
+    {0.0f, 1.0f}         // LVC_FREEZE
 }};
 
 static const float LVC_DEFAULTS[LVC_CONTROL_NR] = {
@@ -497,6 +500,7 @@ static const float LVC_DEFAULTS[LVC_CONTROL_NR] = {
     1.0f,     // LVC_CRUSHMIX (fully wet: old sessions sound the same)
     20000.0f, // LVC_CRUSHLP (open: old sessions sound the same)
     2741.0f,  // LVC_CHCUSTOM (C major: 0x0AB5, used when Custom is selected)
+     0.0f,    // LVC_FREEZE (off: old sessions sound the same)
 };
 
 // Parameter symbols (stable identifiers used by hosts, sessions and preset files). Never reorder or rename.
@@ -650,6 +654,7 @@ static const char* const LVC_SYMBOLS[LVC_CONTROL_NR] = {
     "livecut_crushmix",
     "livecut_crushlp",
     "livecut_chcustom",
+    "livecut_freeze",
 };
 
 // Chroma scales: bit i set = the note i semitones above the root belongs to the scale.

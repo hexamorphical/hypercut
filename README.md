@@ -17,8 +17,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.2.1/HyperCut-0.2.1-windows-x64.zip"><img alt="Download for Windows" src="https://img.shields.io/badge/Download-Windows-2f81f7?style=for-the-badge"></a>
-  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.2.1/HyperCut-0.2.1-macos-universal.zip"><img alt="Download for macOS" src="https://img.shields.io/badge/Download-macOS-8250df?style=for-the-badge"></a>
+  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.3/HyperCut-0.3-windows-x64.zip"><img alt="Download for Windows" src="https://img.shields.io/badge/Download-Windows-2f81f7?style=for-the-badge"></a>
+  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.3/HyperCut-0.3-macos-universal.zip"><img alt="Download for macOS" src="https://img.shields.io/badge/Download-macOS-8250df?style=for-the-badge"></a>
   <a href="https://github.com/hexamorphical/hypercut/releases/latest/download/HyperCut-linux-x86_64.zip"><img alt="Download for Linux" src="https://img.shields.io/badge/Download-Linux-e8a33d?style=for-the-badge"></a>
 </p>
 
@@ -224,6 +224,17 @@ Effects in front of SLICE process what the slicer records; the ones after it pro
 - **Circular min/max knobs** for every range: the outer arc is the modulation range, its two ends are dragged to set
   the bounds, and the pointer rotates to the value picked for the slice playing now. Shift or the wheel fine-tunes,
   double-click resets. A tooltip shows the exact numbers.
+- **Freeze** (centred tab on top of the LIVE CUTS visualiser): arms Freeze and, on the next bar line, records the last
+  two bars of the final output — exactly what you just heard, chops and effects included — then loops that recording
+  verbatim instead of picking new random cuts. Every slice, pan, pitch and cut-synchrone effect repeats identically on
+  each lap, and the capture buffer, phrase map, playhead and output scope are coloured by the recorded chops. The phrase
+  map is locked to a fixed two-bar window, matching the output scope, so it no longer changes scale with the random phrase
+  length; it keeps showing the exact same slices that were playing when Freeze was pressed, with the playhead following the
+  captured two bars wherever they fall in the phrase, including across a phrase boundary — it never swaps in a fresh set of
+  chops from the live cutter. Stopping the host transport silences the loop, and pressing Freeze again while stopped rejoins
+  the live signal immediately. While it is on,
+  a strong cool blue colour grade is applied to the whole interface, with a low-opacity procedural frost texture
+  gathering at the edges so the controls stay legible. Press again to rejoin the host's grid at the next bar line.
 - **Resizable**: the layout scales and the fonts are re-rendered sharply at any size.
 - Your theme, language and window size are saved per user in `~/.config/HyperCut/ui.conf`
   (`%APPDATA%\HyperCut` on Windows, `~/Library/Preferences/HyperCut` on macOS).

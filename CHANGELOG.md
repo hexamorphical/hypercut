@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.3
+
+- **Freeze.** A snowflake tab centred on top of the LIVE CUTS visualiser arms Freeze; on the next bar line it records
+  the last two bars of the *final output* — exactly what you just heard, with its chops and effects already baked in —
+  and loops that recording verbatim instead of picking new random cuts. Every slice, pan, pitch and cut-synchrone
+  effect repeats identically on each lap, and the capture buffer, phrase map, playhead and output scope are coloured by
+  the recorded chops. The phrase map is locked to a fixed two-bar window, matching the output scope, so it no longer changes scale with the random phrase length; it keeps showing the exact same slices that were playing when Freeze was pressed, and the playhead follows the captured two bars wherever they fall in the phrase (including across a phrase boundary) — it never swaps in a fresh set of chops from the live cutter. Stopping the host transport silences the loop, and pressing Freeze again while stopped rejoins the live signal immediately. While it is on, a strong cool blue colour grade covers the whole interface, with a low-opacity
+  procedural frost texture at the edges so everything stays readable. Press it again to rejoin the host's grid at the
+  next bar line. Freeze is a new parameter appended at the end of the list, so existing sessions start with it off.
+- **Freeze playback and LIVE CUTS sync fix.** Freeze now replays the exact two bars captured at the bar line, and the
+  LIVE CUTS map no longer rescales to the random phrase length: it is a fixed two-bar window like the output scope below,
+  so the playhead and highlighted slices stay in step with the audio being replayed, including when the captured window
+  crosses a phrase boundary. A stopped DAW transport now silences the loop, and switching Freeze off while stopped
+  rejoins the live signal immediately instead of waiting for a bar line that never arrives.
+- **Clickable signal-flow blocks.** Every module in the single-row signal flow — including the limiter tail — now
+  switches on and off with a click, without dragging it to a new position. Compact line icons sit to the left of each
+  block so the chain stays on one row at any window size.
+- **Even filter and crush scopes.** The FILTER and CRUSH visualisers now share the same clamped height as the rest of
+  the scopes, so switching algorithms or resizing the window no longer stretches one of them out of proportion.
+- **Frosted theme polish.** The freeze colour grade is cooler and the frost texture lighter so every control stays
+  legible. Light mode now starts with the CRT look off unless you switch it on, the FREEZE tab lines up with the
+  visualiser title, and the wordmark splits into a plain "hyper" and a gradient "Cut".
+
 ## v0.2.4
 
 - **Pitchmap key presets.** The spectral pitchmap now uses three dropdowns — **KEY**, **SCALE** (Major, Melodic Minor,

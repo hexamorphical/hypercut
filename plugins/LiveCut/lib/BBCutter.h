@@ -87,6 +87,7 @@ struct CutInfo
 	// bit crusher
 	float bits;
 	float sr;
+	long fxCut;   // freeze: index in the original cut list, so FX values repeat exactly each loop
 	CutInfo();
 };
 
@@ -365,6 +366,12 @@ public:
 	LivePlayer();
 	void SetListenerManager(ListenerManager *lm);
   void SetFade(float v);
+  // Hold the current capture buffer / cut list and loop it instead of recording over it.
+  // Freeze takes effect as soon as the current block has finished being recorded.
+  void SetFreeze(bool v);
+  // Hold an externally captured two-bar waveform and replay the current cut pattern over it.
+  // The cut list is expanded to fill the loop, so every chop and cut-synchrone effect still fires.
+  void SetFreezeLoop(const float* l, const float* r, long size);
   void OnBlock(std::vector<CutInfo> newcuts);
 
   // read-only accessors (used for visualisation)
@@ -373,6 +380,7 @@ public:
   inline long GetReadIndex() const { return readindex; }
   inline long GetInputIndex() const { return inputindex; }
   inline long GetBufferSize() const { return long(inputbufferL.size()); }
+  inline long GetLoopCount() const { return freezeLoopCount; } // increments each time the frozen loop wraps
   inline const std::vector<CutInfo>& GetCuts() const { return cuts; }
   inline float GetLastGain() const { return lastgain; } // envelope x amp of the last output sample
   // trance gate: envelope of the last sample (0..1, gate shut .. fully open) and how deeply it shapes the level
@@ -405,13 +413,22 @@ public:
 
   inline bool tick(float &outL, float &outR,const float inL,const float inR)
   {
+    // Freeze never bypasses the cut list: the captured two bars are replayed through the same
+    // cuts, so panning, envelopes, pitch and every cut-synchrone effect loop with the audio and
+    // the playhead / output scope keep seeing real chop boundaries.
     if(currentcut<cuts.size())
     {
-      if(inputindex<inputbufferL.size()) //store input
+      // A freeze requested mid-block only becomes active once that block has been fully captured,
+      // so no unwritten (silent) part of the buffer is ever looped.
+      if(freezeRequested && !freezeActive && inputindex>=long(inputbufferL.size()))
+        freezeActive = true;
+      if(!freezeActive && inputindex<long(inputbufferL.size())) //store input
       {
         inputbufferL[inputindex] = inL;
         inputbufferR[inputindex] = inR;
         inputindex++;
+        if(freezeRequested && inputindex>=long(inputbufferL.size()))
+          freezeActive = true;
       }
       
       const CutInfo &cc = cuts[currentcut];
@@ -469,45 +486,26 @@ public:
       
       if(readindex>=cuts[currentcut].size) //end of cut
       {
-        currentcut++;
-        readindex = 0;
-        if(currentcut>=cuts.size())
+        if(freezeActive && currentcut+1>=long(cuts.size()))
         {
-          outL = 0.f;
-          outR = 0.f;
-          return false;
+          // loop the stored block instead of running off the end into silence.
+          // PrimeCut(0) below re-fires every cut-synchrone effect for the new pass.
+          currentcut = 0;
+          readindex = 0;
+          ++freezeLoopCount;
         }
-				const float amp = cuts[currentcut].amp;
-				const float pan = cuts[currentcut].pan;
-        ll = amp * ((pan<0)? 1.f :  cos(pan*2*pi_4));
-        lr = amp * ((pan<0)? 0.f :  sin(pan*2*pi_4));
-        rl = amp * ((pan>0)? 0.f : -sin(pan*2*pi_4));
-        rr = amp * ((pan>0)? 1.f :  cos(pan*2*pi_4));
-        
-        curpitched = fabs(cuts[currentcut].cents) > 1e-10;
-        if(curpitched)
+        else
         {
-          //resample (from the cut's slice offset; 0 for every algorithm except Euclid slices)
-          const long src0 = cuts[currentcut].offset;
-          const double ratio = pow(2.f,cuts[currentcut].cents/1200.f);
-          const long sz = std::min(   long(pitchedbufferL.size()),
-                                   (long(double(inputbufferL.size() - src0)/ratio)-1));
-          for(int i=0;i<sz;++i)
+          currentcut++;
+          readindex = 0;
+          if(currentcut>=long(cuts.size()))
           {
-            const long pos = src0 + long(float(i)*ratio);
-            const float frac = float(i)*ratio-float(pos);
-            const float a = inputbufferL[pos]*(1-frac)+inputbufferL[pos+1]*frac;
-            const float b = inputbufferR[pos]*(1-frac)+inputbufferR[pos+1]*frac;
-            pitchedbufferL[i] = a;
-            pitchedbufferR[i] = b;
+            outL = 0.f;
+            outR = 0.f;
+            return false;
           }
-          L = &pitchedbufferL;
-          R = &pitchedbufferR;
         }
-        // tell cut-synchrone effects
-        if(listenermanager)
-          listenermanager->OnCut(currentcut,cuts.size()); // allow interpolation...
-        
+        PrimeCut(currentcut);
         return true;
       }
     }
@@ -522,6 +520,11 @@ public:
   }
   
 private:
+  // prime the pan/detune state for a cut (also fires the cut-synchrone effect callbacks)
+  void PrimeCut(long i);
+  // repeat the current cut pattern until it fills the frozen loop (called by SetFreezeLoop)
+  void BuildFreezeCuts(long loopLen);
+
 	std::valarray<float> inputbufferL;
 	std::valarray<float> inputbufferR;
 	std::valarray<float> pitchedbufferL;
@@ -535,6 +538,17 @@ private:
   float lastgain;
   float gateenv = 1.f, gatedepth = 1.f;
   bool curpitched;
+  // freeze: keep recording until the current block is complete, then stop overwriting the buffer and loop it
+  bool freezeRequested = false;
+  bool freezeActive = false;
+  // Freeze replay: the two-bar snapshot replaces the capture buffer and the cut pattern is
+  // expanded across it. The live state is saved so releasing freeze restores it seamlessly.
+  std::valarray<float> savedInputL, savedInputR, savedPitchedL, savedPitchedR;
+  std::vector<CutInfo> savedCuts, freezeCuts;
+  long savedCurrentCut = 0, savedReadIndex = 0, savedInputIndex = 0;
+  bool savedCurPitched = false;
+  long freezeLoopCount = 0;      // number of times the frozen loop has wrapped
+  long freezeFxNumCuts = -1;     // original cut count while frozen (FX values repeat exactly)
   std::vector<CutInfo> cuts;
 	ListenerManager *listenermanager;
 };
