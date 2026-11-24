@@ -1217,6 +1217,7 @@ void	BBCutter::SetSampleRate(double v)
 
 void	BBCutter::SetTimeInfos(double bpm,double num,double den,double srate)
 {
+  const bool meterChanged = numerator != num || denominator != den;
   bool changed = false;
   if(tempo != bpm)
   {
@@ -1239,7 +1240,13 @@ void	BBCutter::SetTimeInfos(double bpm,double num,double den,double srate)
     changed = true;
   }
   if(changed)
+  {
+    // SamplesPerBar must follow the current meter, not the constructor's 4/4.
+    beatsPerBar = 4.0 * numerator / denominator;
     UpdateRates();
+  }
+  if(meterChanged)
+    ResetPhrase();
 }
 
 void	BBCutter::UpdateRates()
@@ -1300,7 +1307,8 @@ void	BBCutter::Unit(long bar, long sd)
 
 void	BBCutter::SetPosition(long bar, long sd)
 {
-  const long delta = sd - (unitsdone % long(UnitsPerBar(subdiv,numerator,denominator)));
+  // sd already counts subdivisions of one whole bar, in every meter.
+  const long delta = sd - (unitsdone % subdiv);
   unitsinsideblock += delta;
   unitsdone += delta;
   Unit(bar,sd);

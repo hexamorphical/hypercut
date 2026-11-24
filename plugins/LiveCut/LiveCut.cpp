@@ -1349,7 +1349,8 @@ protected:
             const double bar  = timePos.bbt.bar - 1;
             const double beat = timePos.bbt.beat - 1;
             const double beatFraction = timePos.bbt.ticksPerBeat > 0.0 ? timePos.bbt.tick / timePos.bbt.ticksPerBeat : 0.0;
-            ppqPos = (bar * beats_per_bar) + beat + beatFraction;
+            // BBT beats use the time-signature denominator; PPQ uses quarter notes.
+            ppqPos = ((bar * beats_per_bar) + beat + beatFraction) * (4.0 / beat_unit);
             freeRunPpq = ppqPos;
         }
         else
