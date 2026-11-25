@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.1
+
+- **SQPusher chopping fix.** The block length now matches the durations of the generated cuts
+  (`temp * SubDiv / 8`, not the inverted `temp * 8 / SubDiv`) and fill segments advance by their
+  real length. Higher subdivisions no longer re-arm the player on every grid unit — which used to
+  cut off the pre-baked fills and leave only the first 16th note of each pattern audible. Empty
+  slots in the original fill table are skipped instead of stalling on the previous cut.
+
 ## v0.3
 
 - **Freeze.** A snowflake tab centred on top of the LIVE CUTS visualiser arms Freeze; on the next bar line it records

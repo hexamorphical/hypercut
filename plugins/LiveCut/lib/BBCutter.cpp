@@ -431,6 +431,12 @@ void SQPusherCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
   
   if(fill==true)
   {
+    // Two pre-baked slots in the original table (cs[6][3], cs[8][2]) are empty. Skip them:
+    // LivePlayer::OnBlock() ignores an empty list, which would keep replaying the previous cuts
+    // while the scheduler moved on — exactly the kind of stuck 16th-note pattern being fixed.
+    while(fillpos<cs[fillnumber].size() && cs[fillnumber][fillpos].empty())
+      ++fillpos;
+
     if(fillpos<cs[fillnumber].size())
     {
       lastkind = kBlockFill;
@@ -450,7 +456,10 @@ void SQPusherCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
         cuts[i].amp = Math::randomfloat(minamp,maxamp);
         cuts[i].cents = Math::randomfloat(mindetune,maxdetune);
       }
-      unitsdone = long(double(subdiv)*beatsdone/4.0);
+      // Beats in the fill segment -> grid units. unitsdone is passed by value, so advancing it
+      // here has no effect on the caller; the block length is what tells BBCutter::Unit when to
+      // choose the next segment of the pre-baked fill.
+      unitsinblock = std::max(1L, long(double(subdiv)*beatsdone/4.0 + 0.5));
       if(unitsinblock>unitsleft)
         unitsinblock=unitsleft; //will automatically interrupt cutsequence before its end
       fillpos++;
@@ -468,7 +477,11 @@ void SQPusherCutProc::ChooseCuts(std::vector<CutInfo> &cuts,
     if(beatpos == 2)
       temp=1;
     
-    unitsinblock = long(double(temp*8.0)/double(subdiv));
+    // temp quavers (or temp*2 semiquavers) last temp*0.5 beats, i.e. temp*subdiv/8 grid units.
+    // The old temp*8/subdiv was inverted: at subdiv 8 it happened to be right, but above 8 it
+    // shrank towards 0 (always 0 at 32), so BBCutter::Block re-armed the player on every unit
+    // and only the first 16th of each freshly chosen pattern was ever heard.
+    unitsinblock = std::max(1L, long(double(temp*subdiv)/8.0 + 0.5));
     if(unitsinblock>unitsleft)
       unitsinblock=unitsleft; //will automatically interrupt cutsequence before its end
     

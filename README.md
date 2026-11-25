@@ -17,9 +17,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.3/HyperCut-0.3-windows-x64.zip"><img alt="Download for Windows" src="https://img.shields.io/badge/Download-Windows-2f81f7?style=for-the-badge"></a>
-  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.3/HyperCut-0.3-macos-universal.zip"><img alt="Download for macOS" src="https://img.shields.io/badge/Download-macOS-8250df?style=for-the-badge"></a>
-  <a href="https://github.com/hexamorphical/hypercut/releases/latest/download/HyperCut-linux-x86_64.zip"><img alt="Download for Linux" src="https://img.shields.io/badge/Download-Linux-e8a33d?style=for-the-badge"></a>
+  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.3.1/HyperCut-0.3.1-windows-x64.zip"><img alt="Download for Windows" src="https://img.shields.io/badge/Download-Windows-2f81f7?style=for-the-badge"></a>
+  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.3.1/HyperCut-0.3.1-macos-universal.zip"><img alt="Download for macOS" src="https://img.shields.io/badge/Download-macOS-8250df?style=for-the-badge"></a>
+  <a href="https://github.com/hexamorphical/hypercut/releases/download/v0.3.1/HyperCut-0.3.1-linux-x86_64.zip"><img alt="Download for Linux" src="https://img.shields.io/badge/Download-Linux-e8a33d?style=for-the-badge"></a>
 </p>
 
 ![HyperCut](docs/images/screenshot.png)
