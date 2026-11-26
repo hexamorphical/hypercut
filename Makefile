@@ -50,3 +50,9 @@ clean:
 # --------------------------------------------------------------
 
 .PHONY: dgl plugins tests
+
+# Headless meter regression tests.
+test-meter:
+	bash tests/run-meter-tests.sh "$(CURDIR)"
+
+.PHONY: test-meter
